@@ -9,6 +9,7 @@ import os
 import tarfile
 from pathlib import Path
 
+import pathspec
 from packaging.utils import canonicalize_name
 
 from .. import __version__
@@ -17,6 +18,7 @@ from .._logging import rich_print
 from ..settings.skbuild_read_settings import SettingsReader
 from ._file_processor import each_unignored_file
 from ._init import setup_logging
+from ._pathutil import iter_force_include
 from .generate import generate_file_contents
 from .metadata import get_standard_metadata
 from .wheel import _build_wheel_impl
@@ -110,9 +112,7 @@ def build_sdist(
     timestamp = get_reproducible_epoch() if reproducible else None
 
     metadata = get_standard_metadata(pyproject, settings)
-    # Using deepcopy here because of a bug in pyproject-metadata
-    # https://github.com/FFY00/python-pyproject-metadata/pull/49
-    pkg_info = bytes(copy.deepcopy(metadata).as_rfc822())
+    pkg_info = bytes(metadata.as_rfc822())
 
     # Names must be normalized per PEP 625
     sdist_name = canonicalize_name(metadata.name).replace("-", "_")
@@ -127,8 +127,8 @@ def build_sdist(
     for gen in settings.generate:
         if gen.location == "source":
             contents = generate_file_contents(gen, metadata)
-            gen.path.write_text(contents)
-            settings.sdist.include.append(str(gen.path))
+            gen.path.write_text(contents, encoding="utf-8")
+            settings.sdist.include.append(gen.path.as_posix())
 
     sdist_dir.mkdir(parents=True, exist_ok=True)
     with contextlib.ExitStack() as stack:
@@ -138,7 +138,12 @@ def build_sdist(
             )
         )
         tar = stack.enter_context(
-            tarfile.TarFile(fileobj=gzip_container, mode="w", format=tarfile.PAX_FORMAT)
+            tarfile.TarFile(
+                fileobj=gzip_container,
+                mode="w",
+                format=tarfile.PAX_FORMAT,
+                dereference=settings.sdist.resolve_symlinks == "all",
+            )
         )
         assert settings.sdist.inclusion_mode is not None
         paths = sorted(
@@ -154,6 +159,28 @@ def build_sdist(
             tar.add(
                 filepath,
                 arcname=srcdirname / filepath,
+                filter=normalize_tar_info if reproducible else lambda x: x,
+            )
+
+        # A force-included file is forced in; a force-included directory's
+        # members stay subject to sdist.exclude (mirrors wheel.force-include).
+        sdist_exclude_spec = pathspec.GitIgnoreSpec.from_lines(settings.sdist.exclude)
+        forced = []
+        for source, dest in settings.sdist.force_include.items():
+            source_is_file = Path(source).expanduser().is_file()
+            for src_file, target in iter_force_include(source, dest, Path(srcdirname)):
+                if not source_is_file and sdist_exclude_spec.match_file(
+                    target.relative_to(srcdirname)
+                ):
+                    continue
+                forced.append((src_file, target))
+        # Sort by archive name so the tar member order (and thus the reproducible
+        # .tar.gz bytes) does not depend on filesystem ordering for directories.
+        forced.sort(key=lambda pair: pair[1])
+        for src_file, target in forced:
+            tar.add(
+                src_file,
+                arcname=target,
                 filter=normalize_tar_info if reproducible else lambda x: x,
             )
 

@@ -14,10 +14,14 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any, Literal, overload
 
+import download_wheels
 import packaging.tags
 import packaging.utils
+import pytest
 import virtualenv as _virtualenv
 from filelock import FileLock
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 if sys.version_info < (3, 11):
     import tomli as tomllib
@@ -29,16 +33,12 @@ if sys.version_info < (3, 10):
 else:
     from typing import TypeGuard
 
-
-import download_wheels
-import pytest
-from packaging.requirements import Requirement
-from packaging.version import Version
-
 DIR = Path(__file__).parent.resolve()
 BASE = DIR.parent
 
 VIRTUALENV_VERSION = Version(metadata.version("virtualenv"))
+
+UV = shutil.which("uv")
 
 
 def _is_valid_wheel(wheel: Path) -> bool:
@@ -67,9 +67,19 @@ def pep518_wheelhouse(
     wheelhouse = pytestconfig.cache.mkdir("wheelhouse")
     tmp_path = tmp_path_factory.mktemp("wheelhouse_tmp")
 
-    main_lock = FileLock(wheelhouse / "main.lock")
-    with main_lock:
-        if not list(tmp_path.glob("scikit_build_core-*.whl")):
+    # A single lock for all wheelhouse mutations prevents cross-lock races on
+    # Windows where concurrent readers (zipfile.is_zipfile) and writers
+    # (unlink/replace) on different locks would cause PermissionError (WinError 5).
+    wheelhouse_lock = FileLock(wheelhouse / "wheels.lock")
+    with wheelhouse_lock:
+        # Only build the scikit-build-core wheel when the current version is not
+        # already present; this avoids a redundant pip-wheel invocation on every
+        # worker while still catching version changes between runs.
+        skbuild_version = metadata.version("scikit-build-core")
+        if not any(
+            whl.name.startswith(f"scikit_build_core-{skbuild_version}-")
+            for whl in wheelhouse.glob("scikit_build_core-*.whl")
+        ):
             subprocess.run(
                 [
                     sys.executable,
@@ -87,9 +97,9 @@ def pep518_wheelhouse(
             )
             for wheel in tmp_path.glob("*.whl"):
                 target = wheelhouse / wheel.name
-                tmp_target = target.with_suffix(".whl.tmp")
-                shutil.copy(wheel, tmp_target)
-                tmp_target.replace(target)
+                if _is_valid_wheel(target):
+                    continue  # already present and valid; skip to avoid PermissionError on Windows
+                shutil.copy(wheel, target)
 
             # Remove stale scikit-build-core wheels that weren't just copied
             copied = {f.name for f in tmp_path.glob("scikit_build_core-*.whl")}
@@ -97,15 +107,8 @@ def pep518_wheelhouse(
                 if stale.name not in copied:
                     stale.unlink()
 
-        # Clean up any invalid or orphaned wheels (including deps-of-deps that
-        # may have been fetched or corrupted previously).  We only remove
-        # invalid files here so that valid dependency wheels remain available
-        # to other xdist workers.
-        _clean_wheelhouse(wheelhouse)
-
-    wheels_lock = FileLock(wheelhouse / "wheels.lock")
-    with wheels_lock:
-        # Remove stale/invalid wheels that could falsely satisfy the check.
+        # Clean up any invalid or orphaned wheels.  Because we hold the single
+        # shared lock here, there are no concurrent readers to race against.
         _clean_wheelhouse(wheelhouse)
 
         if not all(
@@ -191,9 +194,32 @@ class VEnv:
     def module(self, *args: str) -> None:
         return self.run(str(self.executable), "-m", *args)
 
-    def install(self, *args: str, isolated: bool = True) -> None:
-        isolated_flags = "" if isolated else ["--no-build-isolation"]
-        self.module("pip", "install", *isolated_flags, *args)
+    def install(
+        self,
+        *args: str,
+        isolated: bool = True,
+        installer: Literal["auto", "pip", "uv"] = "auto",
+    ) -> None:
+        """Install into the venv.
+
+        The default installer ("auto") uses uv when available, since it is
+        much faster. Installs that are themselves under test (``.`` /
+        ``-e .``) must pin ``installer="pip"`` so the frontend being
+        exercised doesn't depend on what happens to be on PATH.
+        """
+        if installer == "auto":
+            installer = "pip" if UV is None else "uv"
+        isolated_flags = [] if isolated else ["--no-build-isolation"]
+        if installer == "uv":
+            if UV is None:
+                msg = "installer='uv' requested but uv is not on PATH"
+                raise RuntimeError(msg)
+            cmd = [UV, "pip", "install", f"--python={self.executable}"]
+            if self.wheelhouse is not None:
+                cmd += ["--no-index", f"--find-links={self.wheelhouse}"]
+            self.run(*cmd, *isolated_flags, *args)
+        else:
+            self.module("pip", "install", *isolated_flags, *args)
 
     def prepare_no_build_isolation(self) -> None:
         if not self.wheelhouse:
@@ -345,10 +371,6 @@ def isolate(request: pytest.FixtureRequest, isolated: VEnv) -> Isolate:
     )
 
 
-def is_editable_mode(maybe_mode: str) -> TypeGuard[Literal["redirect", "inplace"]]:
-    return maybe_mode in {"redirect", "inplace"}
-
-
 @dataclasses.dataclass(frozen=True)
 class Editable:
     mode: Literal["redirect", "inplace"] | None
@@ -359,6 +381,12 @@ class Editable:
         if not self.mode:
             return self.config_settings
         return [*self.config_settings, "-e"]
+
+
+def is_editable_mode(
+    maybe_mode: str | None,
+) -> TypeGuard[Literal["redirect", "inplace"]]:
+    return maybe_mode in {"redirect", "inplace"}
 
 
 @pytest.fixture(params=[pytest.param(None, id="not_editable"), "redirect", "inplace"])
@@ -403,6 +431,26 @@ def protect_get_requires(fp, monkeypatch):
         return orig_find_spec(name, package)
 
     monkeypatch.setattr(importlib.util, "find_spec", find_spec)
+
+
+@pytest.fixture(autouse=True)
+def _stub_macos_arch_probe(request: pytest.FixtureRequest) -> None:
+    """
+    ``program_search.compute_timeout`` shells out to ``lipo`` on macOS arm64
+    (when ``CI`` is unset) to detect x86 binaries. Tests that fake subprocesses
+    with the ``fp`` fixture don't register that call, so it raises
+    ``ProcessNotRegisteredError`` locally (CI passes only because the ``CI`` env
+    var short-circuits the probe). Stub it out for fake-subprocess tests; real
+    tests still exercise the genuine ``lipo`` path.
+    """
+    if "fp" not in request.fixturenames:
+        return
+
+    from scikit_build_core import program_search
+
+    monkeypatch = request.getfixturevalue("monkeypatch")
+    monkeypatch.setattr(program_search, "_macos_binary_is_x86", lambda _path: False)
+    program_search.compute_timeout.cache_clear()
 
 
 @pytest.fixture

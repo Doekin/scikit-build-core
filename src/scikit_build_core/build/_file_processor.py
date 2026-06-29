@@ -31,6 +31,19 @@ def __dir__() -> list[str]:
     return __all__
 
 
+def _dir_key(dirstr: str) -> tuple[int, int] | None:
+    """
+    Identify a directory by its (device, inode) pair so that symlink loops can
+    be detected. Returns None if the directory can't be stat'd (it is then
+    treated as not-yet-seen and handled normally).
+    """
+    try:
+        st = Path(dirstr).stat()
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
 def each_unignored_file(
     starting_path: Path,
     include: Sequence[str] = (),
@@ -74,10 +87,33 @@ def each_unignored_file(
 
     include_spec = pathspec.GitIgnoreSpec.from_lines(include)
 
+    # Map each visited directory to the set of (device, inode) keys of itself
+    # and all of its ancestors along the walk path. A circular symlink
+    # (e.g. pkg/sub/pkg -> ../../pkg) re-enters a directory that is one of its
+    # own ancestors; pruning it stops os.walk from descending forever or
+    # emitting duplicated, ever-deeper copies of the same files (#1101). A
+    # symlink to an unrelated directory is not an ancestor of itself, so it is
+    # still followed.
+    ancestor_keys: dict[str, frozenset[tuple[int, int]]] = {}
+
     for dirstr, dirs, filenames in os.walk(str(starting_path), followlinks=True):
         dirpath = Path(dirstr)
+        key = _dir_key(dirstr)
+        # os.path.dirname keeps the exact string form os.walk uses for keys
+        # (e.g. "" for the root), unlike Path.parent which maps it to ".".
+        parent_keys = ancestor_keys.get(os.path.dirname(dirstr), frozenset())  # noqa: PTH120
+        if key is not None and key in parent_keys:
+            logger.debug(
+                "Not descending into {} because it is an ancestor of itself "
+                "(symlink loop).",
+                dirpath,
+            )
+            dirs.clear()
+            continue
+        if key is not None:
+            ancestor_keys[dirstr] = parent_keys | {key}
         if mode != "classic":
-            for dname in dirs:
+            for dname in list(dirs):
                 if not match_path(
                     dirpath,
                     dirpath / dname,
@@ -88,9 +124,12 @@ def each_unignored_file(
                     nested_excludes,
                     is_path=True,
                 ):
-                    # Check to see if any include rules start with this
-                    dstr = (dirpath / dname).as_posix().strip("/") + "/"
-                    if not any(p.lstrip("/").startswith(dstr) for p in include):
+                    # Only prune if no include pattern could match a file below
+                    # this directory. A literal include deeper than the dir, or
+                    # a glob include (e.g. ``pkg/**/*.py``) whose fixed prefix is
+                    # this dir or an ancestor of it, must keep the dir walkable.
+                    dstr = (dirpath / dname).as_posix().strip("/")
+                    if not any(_include_may_match_below(p, dstr) for p in include):
                         dirs.remove(dname)
 
         for fn in filenames:
@@ -106,6 +145,37 @@ def each_unignored_file(
                 is_path=False,
             ):
                 yield path
+
+
+def _include_may_match_below(pattern: str, dirpath: str) -> bool:
+    """
+    Decide whether an include ``pattern`` could match any file beneath the
+    directory ``dirpath`` (both POSIX, leading/trailing slashes stripped).
+
+    The fixed (glob-free) leading portion of the pattern is compared against the
+    directory. A glob like ``pkg/**/*.py`` has fixed prefix ``pkg`` and could
+    match below ``pkg/sub``; a literal include like ``pkg/sub/file.py`` is
+    deeper than ``pkg`` and must keep ``pkg`` walkable. Both cases reduce to the
+    directory and the fixed prefix sharing an ancestor relationship.
+    """
+    cleaned = pattern.lstrip("/")
+    prefix_parts: list[str] = []
+    for part in cleaned.split("/"):
+        # Stop at the first segment containing a glob metacharacter.
+        if any(ch in part for ch in "*?[") or part == "**":
+            break
+        if part:
+            prefix_parts.append(part)
+    prefix = "/".join(prefix_parts)
+    if not prefix:
+        # A leading glob (e.g. ``**/*.py``) can match anywhere below the dir.
+        return True
+    dir_with_sep = f"{dirpath}/"
+    prefix_with_sep = f"{prefix}/"
+    # dir is an ancestor of (or equal to) the fixed prefix, or vice versa.
+    return prefix_with_sep.startswith(dir_with_sep) or dir_with_sep.startswith(
+        prefix_with_sep
+    )
 
 
 def match_path(

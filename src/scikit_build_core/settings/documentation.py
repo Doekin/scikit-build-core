@@ -26,6 +26,8 @@ def __dir__() -> list[str]:
 
 version_display = ".".join(__version__.split(".")[:2])
 
+NoneType = type(None)
+
 
 def _get_value(value: ast.expr) -> str:
     assert isinstance(value, ast.Constant)
@@ -73,6 +75,10 @@ def get_display_type(field_type: type | str) -> str:
     if is_optional(field_type):
         # Special case for optional, we just take the first part
         return get_display_type(get_args(field_type)[0])
+    if get_origin(field_type) is typing.Union:
+        return " | ".join(
+            get_display_type(a) for a in get_args(field_type) if a is not NoneType
+        )
     # Handle built-ins
     if get_origin(field_type) is dict:
         key_display = get_display_type(get_args(field_type)[0])
@@ -84,8 +90,9 @@ def get_display_type(field_type: type | str) -> str:
     if get_origin(field_type) is typing.Literal:
         return " | ".join(f'"{x}"' for x in get_args(field_type))
     if get_origin(field_type) is Annotated:
-        # For annotated assume we always want the second item
-        return get_display_type(get_args(field_type)[1])
+        # Display the real inner type, not the annotation metadata (e.g.
+        # ``Annotated[Dict[...], "EnvVar"]`` should show the dict, not "EnvVar").
+        return get_display_type(get_args(field_type)[0])
     if field_type is typing.Any:
         # Workaround for python<3.10 where typing.Any.__name__ does not evaluate
         return "Any"

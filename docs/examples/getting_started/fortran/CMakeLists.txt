@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.17.2...3.29)
+cmake_minimum_required(VERSION 3.17.2...4.3)
 project(${SKBUILD_PROJECT_NAME} LANGUAGES C Fortran)
 
 find_package(
@@ -8,13 +8,13 @@ find_package(
 
 # F2PY headers
 execute_process(
-  COMMAND "${PYTHON_EXECUTABLE}" -c
+  COMMAND "${Python_EXECUTABLE}" -c
           "import numpy.f2py; print(numpy.f2py.get_include())"
   OUTPUT_VARIABLE F2PY_INCLUDE_DIR
   OUTPUT_STRIP_TRAILING_WHITESPACE)
 
 add_library(fortranobject OBJECT "${F2PY_INCLUDE_DIR}/fortranobject.c")
-target_link_libraries(fortranobject PUBLIC Python::NumPy)
+target_link_libraries(fortranobject PUBLIC Python::NumPy Python::Module)
 target_include_directories(fortranobject PUBLIC "${F2PY_INCLUDE_DIR}")
 set_property(TARGET fortranobject PROPERTY POSITION_INDEPENDENT_CODE ON)
 

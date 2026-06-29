@@ -55,7 +55,7 @@ the `--sdist` flag. For example, `pipx run build --sdist`. This:
 
 1. Reads `pyproject.toml` to get the `build-system` table.
 2. Set up a new isolated environment with the packages listed in
-   `build-system.requires`..
+   `build-system.requires`.
 3. Run `.get_requires_for_build_sdist(...)` inside the module listed in
    `build-system.build-backend`, if it exists. If this returns a list, install
    all the packages requested. This allows a backend to dynamically declare
@@ -94,7 +94,7 @@ This:
 
 1. Reads `pyproject.toml` to get the `build-system` table.
 2. Set up a new isolated environment with the packages listed in
-   `build-system.requires`..
+   `build-system.requires`.
 3. Run `.get_requires_for_build_wheel(...)` inside the module listed in
    `build-system.build-backend`, if it exists. If this returns a list, install
    all the packages requested. This allows a backend to dynamically declare
@@ -186,10 +186,11 @@ scikit_build_core-0.1.2-py3-none-any.whl
 The three new items here (compared to SDists) are the [compatibility tags][]:
 
 - `python tag`: The first version of Python the wheel is compatible with. Often
-  `py3` for pure Python wheels, or `py312` (etc) for compiled wheels.
+  `py3` for pure Python wheels, or `cp312` (etc) for compiled wheels.
 - `abi tag`: The interpreter ABI this was built for. `none` for pure Python
   wheels or compiled wheels that don't use the Python API, `abi3` for stable ABI
-  / limited API wheels, and `cp312` (etc) for normal compiled wheels.
+  / limited API wheels, `abi3t` for free-threaded stable ABI wheels, and `cp312`
+  (etc) for normal compiled wheels.
 - `platform tag`: This is the platform the wheel is valid on, such as `any`,
   `linux_x86_64`, or `manylinux_2_17_x86_64`.
 

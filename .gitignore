@@ -175,3 +175,8 @@ Thumbs.db
 .vscode/
 uv.lock
 *pylock
+
+# Symlink to AGENTS.md
+CLAUDE.md
+# Claude Code sticks stuff in here
+.claude/

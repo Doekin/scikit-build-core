@@ -44,6 +44,22 @@ It is built with **hatchling** and stored under `src/scikit_build_core/`.
   `validate-pyproject`, JSON schema checks, typos, shellcheck, and
   `sp-repo-review`.
 
+## Things that bite
+
+- **Banned imports are enforced by Ruff.** Use `scikit_build_core._compat.*`
+  shims (`tomllib`, `typing.Self`, `importlib.metadata`, etc.) and
+  `scikit_build_core._vendor.pyproject_metadata` — never the direct modules. See
+  `tool.ruff.lint.flake8-tidy-imports.banned-api` in `pyproject.toml`.
+- **`src/scikit_build_core/_vendor/` is vendored** (`pyproject_metadata`). Do
+  not lint or hand-edit it.
+- **Generated files** — editing the settings model or docstrings requires
+  `nox -t gen`. This regenerates cog sections in `README.md` and
+  `docs/reference/configs.md`, and
+  `src/scikit_build_core/resources/scikit-build.schema.json`.
+- **`tests/packages/`** are sample build fixtures and are excluded from pytest
+  recursion (`norecursedirs`). `tests/utils` is on `pythonpath`.
+- mypy is **strict** for `scikit_build_core.*`, relaxed for tests.
+
 ## Generated files
 
 - `README.md` and `docs/reference/configs.md` contain cog-generated sections.
@@ -166,9 +182,9 @@ The project vendors a copy of `pyproject_metadata` (`_vendor/`) to parse the
 
 Two modes are supported:
 
-- **redirect** (default): A `.pth` file loads an `_<pkg>_editable.py` redirect
-  shim (from `resources/_editable_redirect.py`) that uses `sys.meta_path` to map
-  imports. Optionally triggers CMake rebuild on import if
+- **redirect** (default): A `.pth` file loads an `_editable_skbc_<pkg>.py`
+  redirect shim (from `resources/_editable_redirect.py`) that uses
+  `sys.meta_path` to map imports. Optionally triggers CMake rebuild on import if
   `editable.rebuild = true`.
 - **inplace**: A simple `.pth` file pointing at the source package directories.
 

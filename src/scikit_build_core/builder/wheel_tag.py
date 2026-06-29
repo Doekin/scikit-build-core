@@ -13,7 +13,8 @@ from .._logging import logger
 from .macos import get_macosx_deployment_target
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    import argparse
+    from collections.abc import Iterable, Mapping, Sequence
 
     from .._compat.typing import Self
 
@@ -22,6 +23,35 @@ __all__ = ["WheelTag"]
 
 def __dir__() -> list[str]:
     return __all__
+
+
+class _PyTag:
+    """Helper for interrogating a single Python ABI tag like 'cp39' or 'cp315t'."""
+
+    def __init__(self, tag: str) -> None:
+        self._tag = tag
+
+    @property
+    def is_classic_abi3(self) -> bool:
+        return self._tag.startswith("cp3") and self._tag[3:].isdecimal()
+
+    @property
+    def is_ft_abi3(self) -> bool:
+        return (
+            self._tag.startswith("cp3")
+            and self._tag.endswith("t")
+            and len(self._tag) > 4
+            and self._tag[3:-1].isdecimal()
+        )
+
+    @property
+    def minor(self) -> int:
+        if self.is_ft_abi3:
+            return int(self._tag[3:-1])
+        return int(self._tag[3:])
+
+    def __str__(self) -> str:
+        return self._tag
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,6 +71,8 @@ class WheelTag:
         expand_macos: bool = False,
         root_is_purelib: bool = False,
         build_tag: str = "",
+        cmake_defines: Mapping[str, str] | None = None,
+        cmake_args: Sequence[str] = (),
     ) -> Self:
         if build_tag:
             if not build_tag[0].isdigit():
@@ -84,7 +116,12 @@ class WheelTag:
             plats = [
                 next(
                     packaging.tags.mac_platforms(
-                        get_macosx_deployment_target(arm=arm), arch
+                        get_macosx_deployment_target(
+                            arm=arm,
+                            cmake_defines=cmake_defines,
+                            cmake_args=cmake_args,
+                        ),
+                        arch,
                     )
                 )
                 for arch, arm in pairs
@@ -99,30 +136,57 @@ class WheelTag:
 
         if py_api:
             pyvers_new = py_api.split(".")
-            if all(x.startswith("cp3") and x[3:].isdecimal() for x in pyvers_new):
-                if len(pyvers_new) != 1:
-                    msg = "Unexpected py-api, must be a single cp version (e.g. cp39), not {py_api}"
-                    raise AssertionError(msg)
+            pytags = [_PyTag(x) for x in pyvers_new]
+            gil_disabled = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+            if all(t.is_classic_abi3 or t.is_ft_abi3 for t in pytags):
                 if root_is_purelib:
                     msg = f"Unexpected py-api, since platlib is set to false, must be Pythonless (e.g. py2.py3), not {py_api}"
                     raise AssertionError(msg)
 
-                minor = int(pyvers_new[0][3:])
-                if (
-                    sys.implementation.name == "cpython"
-                    and minor <= sys.version_info.minor
-                    and not sysconfig.get_config_var("Py_GIL_DISABLED")
-                ):
-                    pyvers = pyvers_new
-                    abi = "abi3"
-                else:
-                    msg = "Ignoring py-api, not a CPython interpreter ({}) or version (3.{}) is too high or free-threaded"
-                    logger.debug(msg, sys.implementation.name, minor)
+                classic_tags = [t for t in pytags if t.is_classic_abi3]
+                ft_tags = [t for t in pytags if t.is_ft_abi3]
+
+                if sys.implementation.name == "cpython" and gil_disabled:
+                    # Free-threaded: only accept cp3XXt tags
+                    if ft_tags:
+                        target = ft_tags[0]
+                        if target.minor <= sys.version_info.minor:
+                            # Free-threadedness lives in the abi3t ABI tag only
+                            pyvers = [f"cp3{target.minor}"]
+                            abi = "abi3t"
+                        else:
+                            logger.debug(
+                                "Ignoring py-api, version (3.{}) is too high",
+                                target.minor,
+                            )
+                    elif classic_tags:
+                        logger.debug(
+                            "Ignoring py-api, free-threaded Python doesn't support the classic Stable ABI"
+                        )
+                # Classic CPython
+                elif classic_tags:
+                    target = classic_tags[0]
+                    if (
+                        sys.implementation.name == "cpython"
+                        and target.minor <= sys.version_info.minor
+                    ):
+                        pyvers = [str(target)]
+                        abi = "abi3"
+                    else:
+                        logger.debug(
+                            "Ignoring py-api, not a CPython interpreter ({}) or version (3.{}) is too high",
+                            sys.implementation.name,
+                            target.minor,
+                        )
+                elif ft_tags:
+                    logger.debug(
+                        "Ignoring py-api, free-threaded CPython is required for abi3t"
+                    )
             elif all(x.startswith("py") and x[2:].isdecimal() for x in pyvers_new):
                 pyvers = pyvers_new
                 abi = "none"
             else:
-                msg = f"Unexpected py-api, must be abi3 (e.g. cp39) or Pythonless (e.g. py2.py3), not {py_api}"
+                msg = f"Unexpected py-api, must be abi3 (e.g. cp39), abi3t (e.g. cp315t), or Pythonless (e.g. py2.py3), not {py_api}"
                 raise AssertionError(msg)
 
         return cls(pyvers=pyvers, abis=[abi], archs=plats, build_tag=build_tag)
@@ -157,14 +221,13 @@ class WheelTag:
         return frozenset(itertools.starmap(packaging.tags.Tag, vals))
 
 
-if __name__ == "__main__":
-    import argparse
+def main_wheel_tag(args: argparse.Namespace, /) -> None:
+    comp_tag = WheelTag.compute_best(args.archs, args.abi, root_is_purelib=args.purelib)
+    print(comp_tag)  # noqa: T201
 
-    parser = argparse.ArgumentParser(
-        prog="python -m scikit_build_core.builder.wheel_tag",
-        description="Get the computed wheel tag for the current environment.",
-        allow_abbrev=False,
-    )
+
+def populate_parser(parser: argparse.ArgumentParser, /) -> None:
+    """Add the ``wheel-tag`` arguments to an existing parser."""
     parser.add_argument(
         "--archs",
         nargs="*",
@@ -174,13 +237,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--abi",
         default="",
-        help="Specify py-api, like 'cp38' or 'py3'",
+        help="Specify py-api, like 'cp38', 'cp315t', or 'py3'",
     )
     parser.add_argument(
         "--purelib",
         action="store_true",
         help="Specify a non-platlib (pure) tag",
     )
+    parser.set_defaults(func=main_wheel_tag)
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m scikit_build_core.builder.wheel_tag",
+        description="Get the computed wheel tag for the current environment.",
+        allow_abbrev=False,
+    )
+    populate_parser(parser)
     args = parser.parse_args()
-    tag = WheelTag.compute_best(args.archs, args.abi, root_is_purelib=args.purelib)
-    print(tag)  # noqa: T201
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

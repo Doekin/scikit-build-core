@@ -52,58 +52,6 @@ With this any consuming project that depends on this would automatically work
 with `find_package(MyProject)` as long as it is in the `build-system.requires`
 list.
 
-````{tab} pyproject.toml
-
-```toml
-[tool.scikit-build.search]
-ignore_entry_point = ["MyProject"]
-[tool.scikit-build.search.roots]
-OtherProject = "/path/to/other_project"
-```
-
-````
-
-`````{tab} config-settings
-
-
-````{tab} pip
-
-```console
-$ pip install . -v --config-settings=search.ignore_entry_point="MyProject" --config-settings=search.roots.OtherProject="/path/to/other_project"
-```
-
-````
-
-````{tab} build
-
-```console
-$ pipx run build --wheel -Csearch.ignore_entry_point="MyProject" -Csearch.roots.OtherProject="/path/to/other_project"
-```
-
-````
-
-````{tab} cibuildwheel
-
-```toml
-[tool.cibuildwheel.config-settings]
-"search.ignore_entry_point" = ["MyProject"]
-"search.roots.OtherProject" = "/path/to/other_project"
-```
-
-````
-
-`````
-
-````{tab} Environment
-
-
-```yaml
-SKBUILD_SEARCH_IGNORE_ENTRY_POINT: "MyProject"
-SKBUILD_SEARCH_ROOTS_OtherProject: "/path/to/other_project"
-```
-
-````
-
 ## `CMAKE_PREFIX_PATH`
 
 Another common search path that scikit-build-core populates is the
@@ -125,60 +73,16 @@ dependent projects, which is similarly export as
 MyProject = "myproject"
 ```
 
-````{tab} pyproject.toml
-
-```toml
-[tool.scikit-build.search]
-ignore_entry_point = ["MyProject"]
-prefixes = ["/path/to/prefixA", "/path/to/prefixB"]
-```
-
-````
-
-`````{tab} config-settings
-
-
-````{tab} pip
-
-```console
-$ pip install . -v --config-settings=search.ignore_entry_point="MyProject" --config-settings=search.prefixes="/path/to/prefixA;/path/to/prefixB"
-```
-
-````
-
-````{tab} build
-
-```console
-$ pipx run build --wheel -Csearch.ignore_entry_point="MyProject" -Csearch.prefixes="/path/to/prefixA;/path/to/prefixB"
-```
-
-````
-
-````{tab} cibuildwheel
-
-```toml
-[tool.cibuildwheel.config-settings]
-"search.ignore_entry_point" = ["MyProject"]
-"search.prefixes" = ["/path/to/prefixA", "/path/to/prefixB"]
-```
-
-````
-
-`````
-
-````{tab} Environment
-
-
-```yaml
-SKBUILD_SEARCH_IGNORE_ENTRY_POINT: "MyProject"
-SKBUILD_SEARCH_PREFIXES: "/path/to/prefixA;/path/to/prefixB"
-```
-
-````
-
 ## `CMAKE_MODULE_PATH`
 
 Scikit-build-core also populates `CMAKE_MODULE_PATH` variable used to search for
 CMake modules using the `include()` command (if the `.cmake` suffix is omitted).
+This is populated by reading the entry-point `cmake.module` of the dependent
+projects, which is similarly exported as
+
+```toml
+[project.entry-points."cmake.module"]
+MyProject = "myproject"
+```
 
 [`CMAKE_PREFIX_PATH`]: #cmake-prefix-path

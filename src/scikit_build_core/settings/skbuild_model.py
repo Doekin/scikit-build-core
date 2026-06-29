@@ -13,6 +13,7 @@ __all__ = [
     "CMakeSettings",
     "CMakeSettingsDefine",
     "EditableSettings",
+    "EnvValue",
     "GenerateSettings",
     "InstallSettings",
     "LoggingSettings",
@@ -59,6 +60,84 @@ class CMakeSettingsDefine(str):
             value = raw
 
         return super().__new__(cls, value)
+
+
+class EnvValue:
+    """
+    A single entry in the top-level ``env`` table.
+
+    Accepts either a literal string or a table with ``env`` / ``default`` /
+    ``force`` keys. Resolution against the build environment is deferred to
+    :meth:`resolve` so that the ``force`` flag survives parsing (unlike the
+    ``cmake.define`` ``EnvVar`` form, which resolves at parse time). A bare
+    string is shorthand for ``{ default = "<string>" }``.
+    """
+
+    __slots__ = ("default", "env", "force")
+
+    def __init__(self, raw: Union[str, Dict[str, Any]]) -> None:
+        self.env: Optional[str] = None
+        self.default: Optional[str] = None
+        self.force: bool = False
+
+        if isinstance(raw, str):
+            self.default = raw
+            return
+        if not isinstance(raw, dict):
+            msg = f"Expected str or table for an env value, got {type(raw).__name__}"
+            raise TypeError(msg)
+
+        extra = set(raw) - {"env", "default", "force"}
+        if extra:
+            msg = f"Unrecognized env table keys: {sorted(extra)}"
+            raise TypeError(msg)
+
+        env = raw.get("env")
+        if env is not None and not isinstance(env, str):
+            msg = f"env table 'env' must be a string, got {type(env).__name__}"
+            raise TypeError(msg)
+        default = raw.get("default")
+        if default is not None and not isinstance(default, str):
+            msg = f"env table 'default' must be a string, got {type(default).__name__}"
+            raise TypeError(msg)
+        # Note: bool is an int subclass, so this rejects 0/1 as well as strings;
+        # the value must be a real TOML boolean (not coerced like ``bool("false")``).
+        force = raw.get("force", False)
+        if not isinstance(force, bool):
+            msg = f"env table 'force' must be a boolean, got {type(force).__name__}"
+            raise TypeError(msg)
+
+        self.env = env
+        self.default = default
+        self.force = force
+
+    def resolve(self, env: Dict[str, str]) -> Optional[str]:
+        """
+        Resolve to the final string value (or ``None`` if unset) against ``env``.
+
+        ``env`` (if set) is looked up in the environment with ``default`` as the
+        fallback. ``None`` means "leave the variable unset".
+        """
+        got = env.get(self.env, self.default) if self.env is not None else self.default
+        return None if got is None else str(got)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, EnvValue):
+            return NotImplemented
+        return (self.env, self.default, self.force) == (
+            other.env,
+            other.default,
+            other.force,
+        )
+
+    def __hash__(self) -> int:
+        return hash((self.env, self.default, self.force))
+
+    def __repr__(self) -> str:
+        return (
+            f"EnvValue(env={self.env!r}, default={self.default!r}, "
+            f"force={self.force!r})"
+        )
 
 
 @dataclasses.dataclass
@@ -143,7 +222,7 @@ class CMakeSettings:
     """
     The CMAKE_TOOLCHAIN_FILE / --toolchain used for cross-compilation.
 
-    This is only allowed in overrides or config-settings.
+    This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
     """
 
     python_hints: bool = True
@@ -262,6 +341,42 @@ class SDistSettings:
     If set to True, CMake will be run before building the SDist.
     """
 
+    force_include: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """
+    Force-include files into the SDist.
+
+    Maps source paths to destinations relative to the SDist root. Keys are
+    relative to the project root; they may point outside it (e.g. ``../shared``)
+    or be absolute, and ``~`` is expanded. A source may be a file or a directory;
+    directories are copied recursively, skipping VCS and ``__pycache__`` junk.
+
+    Force-included files override files at the same destination. A missing source
+    is an error.
+
+    A force-included *file* is forced in even if :confval:`sdist.exclude` matches
+    its destination, since naming an exact source is an explicit request. A
+    force-included *directory* stays subject to :confval:`sdist.exclude`, so a
+    bulk copy can still be trimmed by an exclude pattern.
+    """
+
+    resolve_symlinks: Optional[Literal["all", "none"]] = dataclasses.field(
+        default=None,
+        metadata=SettingsFieldMetadata(display_default='"all"'),
+    )
+    """
+    Which symlinks to resolve in the SDist, storing the target's contents instead.
+
+    The modes are:
+
+    * "all": Resolve every symlink, copying its target's contents.
+    * "none": Store symlinks as-is.
+
+    If you don't set this, it will be "all" unless you set the minimum version
+    below 1.0, in which case it will be "none" to preserve backward compatibility.
+
+    .. versionadded: 1.0
+    """
+
 
 @dataclasses.dataclass
 class WheelSettings:
@@ -289,8 +404,11 @@ class WheelSettings:
 
     You can also set this to "cp38" to enable the CPython 3.8+ Stable
     ABI / Limited API (only on CPython and if the version is sufficient,
-    otherwise this has no effect). Or you can set it to "py3" or "py2.py3" to
-    ignore Python ABI compatibility. The ABI tag is inferred from this tag.
+    otherwise this has no effect). For free-threaded Python, you can use
+    "cp315t" to enable the free-threaded stable ABI (only on CPython
+    free-threaded builds and if the version is sufficient). Or you can set
+    it to "py3" or "py2.py3" to ignore Python ABI compatibility. The ABI
+    tag is inferred from this tag.
 
     This value is used to construct ``SKBUILD_SABI_COMPONENT`` CMake variable.
     """
@@ -365,8 +483,38 @@ class WheelSettings:
     Manually specify the wheel tags to use, ignoring other inputs such as
     ``wheel.py-api``. Each tag must be of the format
     {interpreter}-{abi}-{platform}.  If not specified, these tags are
-    automatically calculated. This is only allowed in overrides or
-    config-settings.
+    automatically calculated. This cannot be set in the static
+    ``[tool.scikit-build]`` table; use it in an override, config-settings, or an
+    environment variable.
+    """
+
+    force_include: Dict[str, str] = dataclasses.field(default_factory=dict)
+    """
+    Force-include files into the wheel.
+
+    Maps source paths to destinations relative to the platlib (the package
+    area). Keys are relative to the project root; they may point outside it
+    (e.g. ``../shared``) or be absolute, and ``~`` is expanded. A source may be a
+    file or a directory; directories are copied recursively, skipping VCS and
+    ``__pycache__`` junk.
+
+    A leading ``/data``, ``/scripts``, ``/headers``, ``/platlib``, or
+    ``/metadata`` destination targets that wheel tree instead of the platlib
+    (this requires :confval:`experimental`).
+
+    Force-included files are placed last, so they override discovered package
+    files and CMake output at the same destination. A missing source is an error.
+
+    A force-included *file* also overrides :confval:`wheel.exclude`, since naming
+    an exact source is an explicit request for that file. A force-included
+    *directory* stays subject to :confval:`wheel.exclude`, so a bulk copy can
+    still be trimmed by an exclude pattern.
+
+    If a source is missing on disk, it is looked up through
+    :confval:`sdist.force-include` (by exact destination or under a force-included
+    directory) and read from that original source instead. This lets a source
+    that names an sdist output (vendored via :confval:`sdist.force-include`) build
+    from both a source tree and an unpacked sdist.
     """
 
 
@@ -436,6 +584,21 @@ class InstallSettings:
     The components to install.
 
     If not specified or an empty list, all default components are installed.
+    """
+
+    targets: List[str] = dataclasses.field(default_factory=list)
+    """
+    Build targets to run during the install step via ``cmake --build --target``.
+
+    This is intended for projects that group their install rules under an
+    umbrella "distribution" build target (such as LLVM's ``install-distribution``)
+    rather than using CMake install ``COMPONENT``\\ s. Each listed target is built,
+    which triggers its install rules into the staging prefix.
+
+    This relies on the configure-time ``CMAKE_INSTALL_PREFIX`` (set automatically
+    by scikit-build-core to the wheel staging directory); the ``--strip`` and
+    ``--component`` options of ``cmake --install`` do not apply to these targets.
+    ``components`` and ``targets`` may be combined; both will run.
     """
 
     strip: Optional[bool] = dataclasses.field(
@@ -529,6 +692,20 @@ class ScikitBuildSettings:
     List dynamic metadata fields and hook locations in this table.
     """
 
+    env: Annotated[Dict[str, EnvValue], "EnvTable"] = dataclasses.field(
+        default_factory=dict
+    )
+    """
+    A table of environment variables to set for the CMake subprocesses.
+
+    Applied to the configure, build, and install steps. A variable is only set if
+    not already present (like a ``setdefault``); pass ``force = true`` to
+    overwrite. Each value is a literal string or a table with ``env`` (read from
+    another environment variable), ``default``, and ``force``; an entry that
+    resolves to nothing is skipped. Independent of the ``if.env`` override
+    condition.
+    """
+
     strict_config: bool = True
     """
     Strictly check all config options.
@@ -541,6 +718,46 @@ class ScikitBuildSettings:
     experimental: bool = False
     """
     Enable early previews of features not finalized yet.
+    """
+
+    variant: List[str] = dataclasses.field(
+        default_factory=list,
+        metadata=SettingsFieldMetadata(override_only=True),
+    )
+    """
+    Experimental PEP 817 variant properties.
+
+    This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
+    """
+
+    variant_name: List[str] = dataclasses.field(
+        default_factory=list,
+        metadata=SettingsFieldMetadata(override_only=True),
+    )
+    """
+    Experimental PEP 817 variant properties used for wheel metadata selection.
+
+    This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
+    """
+
+    variant_label: Optional[str] = dataclasses.field(
+        default=None,
+        metadata=SettingsFieldMetadata(override_only=True),
+    )
+    """
+    Experimental PEP 817 wheel variant label override.
+
+    This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
+    """
+
+    null_variant: bool = dataclasses.field(
+        default=False,
+        metadata=SettingsFieldMetadata(override_only=True),
+    )
+    """
+    Experimental PEP 817 null-variant selector.
+
+    This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
     """
 
     minimum_version: Optional[Version] = dataclasses.field(
@@ -565,5 +782,5 @@ class ScikitBuildSettings:
         metadata=SettingsFieldMetadata(override_only=True),
     )
     """
-    Immediately fail the build. This is only allowed in overrides or config-settings.
+    Immediately fail the build. This cannot be set in the static ``[tool.scikit-build]`` table; use it in an override, config-settings, or an environment variable.
     """

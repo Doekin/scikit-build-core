@@ -31,6 +31,20 @@ CMAKE_BUILD_PARALLEL_LEVEL=8 pip install .
 The default generator on Unix-like platforms is Ninja, which automatically tries
 to run in parallel with the number of cores on your machine.
 
+If your project has historically used a different environment variable (such as
+`MAX_JOBS`) to control this, you can forward it to `CMAKE_BUILD_PARALLEL_LEVEL`
+with the `[tool.scikit-build.env]` table:
+
+```toml
+[tool.scikit-build.env]
+CMAKE_BUILD_PARALLEL_LEVEL = { env = "MAX_JOBS" }
+```
+
+A directly-set `CMAKE_BUILD_PARALLEL_LEVEL` still wins, since `env` entries use
+`setdefault` semantics unless `force = true` is given. See
+[](../configuration/index.md#environment-variables-for-the-build) for the full
+`env` table reference, including selecting a compiler and setting search paths.
+
 ## Dynamic setup.py options
 
 While we will eventually have some dynamic options, most common needs can be
@@ -66,13 +80,13 @@ suppresses all output. You can
 printout of the current settings using:
 
 ```bash
-python -m scikit_build_core.builder
+scikit-build builder
 ```
 
 ## Repairing wheels
 
-Like most other backends[^1], scikit-build-core produced `linux` wheels, which
-are not redistrubutable cannot be uploaded to PyPI[^2]. You have to run your
+Like most other backends[^1], scikit-build-core produces `linux` wheels, which
+are not redistributable and cannot be uploaded to PyPI[^2]. You have to run your
 wheels through `auditwheel` to make `manylinux` wheels. `cibuildwheel`
 automatically does this for you. See [repairing](#repairing-wheels).
 
@@ -84,7 +98,7 @@ recipes][]. There are a few things to keep in mind.
 You need to recreate your `build-system.requires` in the `host` table, with the
 conda versions of your dependencies. You also need to add `cmake` and either
 `make` or `ninja` to your `build:` table. Conda-build hard-codes
-`CMAKE_GENERATOR="Unix Makefiles` on UNIX systems, so you have to set or unset
+`CMAKE_GENERATOR="Unix Makefiles"` on UNIX systems, so you have to set or unset
 this to use Ninja if you prefer Ninja. The `scikit-build-core` recipe cannot
 depend on `cmake`, `make`, or `ninja`, because that would add those to the wrong
 table (`host` instead of `build`). Here's an example:
@@ -117,6 +131,51 @@ Windows currently requires a little extra care. You should set the C define
 `Py_GIL_DISABLED` on Windows; due to the way the two builds share the same
 config files, Python cannot set it for you on the free-threaded variant.
 
+## Building wheel variants (experimental)
+
+```{warning}
+This is an early preview of [PEP 817][] wheel variant support. The interface may
+change, and it must be opted into with `experimental = true`.
+```
+
+Scikit-build-core can attach variant metadata to a wheel, producing a
+variant-labeled filename (the label becomes the final field of the wheel name)
+and a `variant.json` file inside `*.dist-info`. This lets you ship several
+wheels for the same version that differ by hardware or library features (CPU
+ABI, CUDA version, BLAS implementation, etc.).
+
+Because each variant of a build needs different settings, the variant options
+are **only allowed in config-settings or `[[tool.scikit-build.overrides]]`** —
+they cannot be hard-coded at the top level of `pyproject.toml`. The relevant
+settings are:
+
+- `variant` / `variant-name`: variant properties in
+  `namespace :: feature :: value` form (repeatable).
+- `variant-label`: override the computed label used in the wheel filename.
+- `null-variant`: build the null variant (mutually exclusive with the above).
+
+When any of these are set, [`variantlib`][] is automatically injected as a build
+requirement, and the experimental flag must be enabled. For example, to build a
+CPU-ABI variant with `pip`:
+
+```bash
+pip wheel . \
+  -Cexperimental=true \
+  -Cvariant="cpu :: abi :: cp313" \
+  -Cvariant-label=cpu
+```
+
+Or to enable it for everyone via an override (still keeping the per-build values
+in config-settings), put the experimental flag in `pyproject.toml`:
+
+```toml
+[tool.scikit-build]
+experimental = true
+```
+
+Pass `-Cvariant=...` (and friends) at build time to select which variant to
+produce.
+
 [^1]:
     Due to a [bug in packaging](https://github.com/pypa/packaging/issues/160),
     some backends may mistakenly produce the wrong tags (including
@@ -133,5 +192,7 @@ config files, Python cannot set it for you on the free-threaded variant.
 [scientific python development guidelines]: https://learn.scientific-python.org/development
 [pybind11 example]: https://github.com/pybind/scikit_build_example
 [dozens of recipes]: https://github.com/search?type=code&q=org%3Aconda-forge+path%3Arecipe%2Fmeta.yaml+scikit-build-core
+[pep 817]: https://peps.python.org/pep-0817
+[`variantlib`]: https://github.com/wheelnext/variantlib
 
 <!-- prettier-ignore-end -->

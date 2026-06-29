@@ -47,21 +47,44 @@ def to_json_schema(dclass: type[Any], *, normalize_keys: bool) -> dict[str, Any]
                     get_args(field.type)[0], normalize_keys=normalize_keys
                 )
                 types = full["patternProperties"][".+"]
+                env_branch = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["env"],
+                    "properties": {
+                        "env": {"type": "string", "minLength": 1},
+                        "default": types,
+                    },
+                }
+                # Flatten a nested oneOf (e.g. Union[str, bool, List[str]]) into
+                # the combined oneOf instead of nesting oneOf inside oneOf. The
+                # branches are mutually exclusive by JSON type, so this is
+                # equivalent and more robust across validate_pyproject /
+                # fastjsonschema versions.
+                value_branches = types["oneOf"] if list(types) == ["oneOf"] else [types]
                 full["patternProperties"][".+"] = {
-                    "oneOf": [
-                        types,
-                        {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "required": ["env"],
-                            "properties": {
-                                "env": {"type": "string", "minLength": 1},
-                                "default": types,
-                            },
-                        },
-                    ]
+                    "oneOf": [*value_branches, env_branch]
                 }
                 props[field.name] = full
+                continue
+            if get_args(field.type)[1] == "EnvTable":
+                # Each value is a literal string or a table reading from another
+                # environment variable, with an optional ``force`` overwrite.
+                table_branch = {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "env": {"type": "string", "minLength": 1},
+                        "default": {"type": "string"},
+                        "force": {"type": "boolean", "default": False},
+                    },
+                }
+                props[field.name] = {
+                    "type": "object",
+                    "patternProperties": {
+                        ".+": {"oneOf": [{"type": "string"}, table_branch]}
+                    },
+                }
                 continue
             msg = "Only EnvVar is supported for Annotated"
             raise FailedConversionError(msg)
@@ -89,7 +112,12 @@ def to_json_schema(dclass: type[Any], *, normalize_keys: bool) -> dict[str, Any]
             field.default_factory is dataclasses.MISSING
             and field.default is dataclasses.MISSING
         ):
-            required.append(field.name)
+            # props keys are dash-normalized below when normalize_keys is set,
+            # so the required names must be normalized the same way to stay
+            # satisfiable.
+            required.append(
+                field.name.replace("_", "-") if normalize_keys else field.name
+            )
 
     if errs:
         msg = f"Failed Conversion to JSON Schema on {dclass.__name__}"

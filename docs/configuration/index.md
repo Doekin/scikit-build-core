@@ -359,6 +359,81 @@ assume `wheel.platlib = false` (purelib targeted instead).
 
 :::
 
+### Force-including files
+
+Sometimes you need to place a specific file (or directory) at a specific path in
+a distribution, even if it lives outside your package tree or is produced
+elsewhere. Each distribution has its own `force-include` table mapping source
+paths to destinations:
+
+```toml
+[tool.scikit-build.sdist.force-include]
+"../shared/data.json" = "mypackage/data.json"
+
+[tool.scikit-build.wheel.force-include]
+"vendor/lib.so" = "mypackage/_lib.so"
+"tools/run.sh"  = "/scripts/run.sh"
+```
+
+The keys are source paths relative to the project root; they may point outside
+it (e.g. `../shared`) or be absolute, and `~` is expanded. A source may be a
+file or a directory, and directories are copied recursively (skipping VCS and
+`__pycache__` junk). A missing source is an error.
+
+`sdist.force-include` destinations are relative to the SDist root.
+`wheel.force-include` destinations are relative to the platlib (the package
+area), and also accept a leading `/data`, `/scripts`, `/headers`, or `/metadata`
+to target that wheel tree instead (this requires `experimental = true`, like
+`wheel.install-dir`). Force-included wheel files are placed last, so they
+override discovered package files and CMake output at the same destination.
+
+A force-included _file_ also overrides the matching exclude list
+(`wheel.exclude` for wheels, `sdist.exclude` for SDists): naming an exact source
+is an explicit request, so it wins even if an exclude pattern matches its
+destination. A force-included _directory_ stays subject to that exclude, so a
+bulk tree copy can still be trimmed by an exclude pattern (e.g. force-include a
+directory and exclude `**/*.bzl` to drop the Bazel files from it).
+
+#### Building a wheel from an SDist
+
+A common pattern vendors an external (`../`) source into the SDist and then
+ships that output in the wheel. Reference the SDist destination as the wheel
+source and it works in both build modes:
+
+```toml
+[tool.scikit-build.sdist.force-include]
+"../shared/data.json" = "mypackage/data.json"   # vendor it into the SDist
+
+[tool.scikit-build.wheel.force-include]
+"mypackage/data.json" = "mypackage/data.json"    # ship the SDist output
+```
+
+When the wheel is built from the unpacked SDist, `mypackage/data.json` exists
+and is used directly. When it is built from the source tree (or an editable
+install) the file was never materialized; a `wheel.force-include` source missing
+on disk is then resolved through `sdist.force-include` (by exact destination, or
+under a force-included directory) and read from that original source instead. An
+on-disk file always wins, so the vendored copy is preferred when present.
+
+For cases the automatic resolution cannot express — e.g. the wheel source is the
+_original_ external path rather than the SDist output — use
+[overrides](#overrides) keyed on `from-sdist`, with a separate
+`wheel.force-include` entry gated on each build mode (source tree vs.
+wheel-from-SDist):
+
+```toml
+[tool.scikit-build.sdist.force-include]
+"../outside.txt" = "vendored/blob.txt"   # vendor it into the SDist
+
+[[tool.scikit-build.overrides]]
+if.from-sdist = false                     # source-tree build: read the original
+wheel.force-include."../outside.txt" = "mypackage/blob.txt"
+
+[[tool.scikit-build.overrides]]
+if.from-sdist = true                      # wheel-from-SDist: read the vendored copy
+wheel.force-include."vendored/blob.txt" = "mypackage/blob.txt"
+```
+
 ## Customizing the output wheel
 
 The python API tags for your wheel will be correct assuming you are building a
@@ -372,7 +447,10 @@ wheel.py-api = "cp38"
 
 Scikit-build-core will only target ABI3 if the version of Python is equal to or
 newer than the one you set. `${SKBUILD_SABI_COMPONENT}` is set to
-`Development.SABIModule` when targeting ABI3, and is an empty string otherwise.
+`Development.SABIModule` when targeting ABI3 or ABI3T, and is an empty string
+otherwise. For free-threaded Python (PEP 703), you can use `cp315t` to target
+the free-threaded stable ABI, which sets `Py_TARGET_ABI3T` (if using CMake
+4.4+). The emitted wheel tag is `cp315-abi3t-*` following per PEP 803.
 
 If you are not using CPython at all, you can specify any version of Python is
 fine:
@@ -424,6 +502,12 @@ You can select a different build type, such as `Debug`:
 ```{conftabs} cmake.build-type "Debug"
 
 ```
+
+If `cmake.build-type` is left at its default and `CMAKE_BUILD_TYPE` is set in
+the environment, that value is used instead. This lets you override the build
+type without editing `pyproject.toml` (for example
+`CMAKE_BUILD_TYPE=RelWithDebInfo`), mirroring CMake's own handling of the
+variable.
 
 You can specify CMake defines as strings or bools:
 
@@ -554,10 +638,90 @@ You can pass raw arguments directly to the build tool, as well:
 
 ```
 
+## Environment variables for the build
+
+The `[tool.scikit-build.env]` table sets environment variables for the CMake
+configure, build, and install subprocesses. Use it for things CMake or the
+generator read _from the environment_ — `CC`/`CXX`, `CFLAGS`,
+`CMAKE_PREFIX_PATH`, compiler launchers, parallel-build level, and so on. For
+CMake `-D` cache entries, use `cmake.define` instead.
+
+Each value is a literal string, or a table that reads from another environment
+variable (`{ env = "OTHER", default = "..." }`). By default a variable is only
+set if it is not already present (`setdefault`); add `force = true` to overwrite
+an existing value. If a value resolves to nothing (its `env` source is unset and
+there is no `default`), the key is skipped. This pairs well with
+`[[tool.scikit-build.overrides]]` for platform- or state-specific values.
+
+```toml
+[tool.scikit-build.env]
+SOME_VAR = "some-value"
+CMAKE_PREFIX_PATH = { env = "CMAKE_PREFIX_PATH", default = "/opt/mydeps" }
+```
+
+A common use is forwarding a project's historical parallelism variable (such as
+`MAX_JOBS`) to `CMAKE_BUILD_PARALLEL_LEVEL`:
+
+```toml
+[tool.scikit-build.env]
+CMAKE_BUILD_PARALLEL_LEVEL = { env = "MAX_JOBS" }
+```
+
+A directly-set `CMAKE_BUILD_PARALLEL_LEVEL` still wins, since `env` entries use
+`setdefault` semantics unless `force = true` is given.
+
+```{note}
+This table is independent of the `if.env` override _condition_. `if.env` only
+matches against the ambient process environment and does not see variables you
+define here.
+```
+
+The table form (`{ env = ..., default = ..., force = ... }`) is `pyproject.toml`
+only; via config-settings or `SKBUILD_ENV_*` you can only set a literal value.
+
+### Selecting a compiler
+
+To pick a specific compiler — for example, to use GCC instead of MSVC on a
+Windows runner — set `CC`/`CXX`, optionally scoped to a platform with an
+override:
+
+```toml
+[[tool.scikit-build.overrides]]
+if.platform-system = "win32"
+env.CC = "gcc"
+env.CXX = "g++"
+```
+
+These take precedence over the compiler scikit-build-core would otherwise pull
+from Python's `sysconfig`, even without `force`.
+
+By default, scikit-build-core sets `CC`/`CXX` from Python's `sysconfig` compiler
+when they are not already set. If a project's compiler probes break on that
+compiler (a conda narrow sysroot, a stale venv gcc, a cross or oneAPI
+toolchain), list the variable in the `env` table to suppress that default and
+let CMake detect the compiler from `PATH` — an entry that reads from the same
+name does this without pinning a value:
+
+```toml
+[tool.scikit-build.env]
+CC = { env = "CC" }
+CXX = { env = "CXX" }
+```
+
+### Search paths for dependencies
+
+To point CMake at extra prefixes (vcpkg, Homebrew, a custom install tree) when
+locating dependencies, set `CMAKE_PREFIX_PATH`:
+
+```toml
+[tool.scikit-build.env]
+CMAKE_PREFIX_PATH = "/opt/mydeps;/usr/local"
+```
+
 ## Editable installs
 
-Experimental support for editable installs is provided, with some caveats and
-configuration. Recommendations:
+Support for editable installs is provided, with some caveats and configuration.
+Recommendations:
 
 - Use `--no-build-isolation` when doing an editable install is recommended; you
   should preinstall your dependencies.
@@ -566,19 +730,16 @@ configuration. Recommendations:
   also enable automatic rebuilds.
 - You need to reinstall to pick up new files.
 
-Known limitations:
-
-- Resources (via `importlib.resources`) are not properly supported (yet).
-  Currently experimentally supported except on Python 3.9 (3.8, 3.10, 3.11,
-  3.12, and 3.13 work). `importlib_resources` may work on Python 3.9.
+Resources (via `importlib.resources`) are supported and tested on all supported
+Python versions. On Python 3.8, use the `importlib_resources` backport, since
+`importlib.resources.files` was added to the standard library in Python 3.9.
 
 ```console
 # Very experimental rebuild on initial import feature
 $ pip install --no-build-isolation --config-settings=editable.rebuild=true -Cbuild-dir=build -ve.
 ```
 
-Due to the length of this line already being long, you do not need to set the
-`experimental` setting to use editable installs, but please consider them
+The automatic rebuild-on-import feature (`editable.rebuild`) is still
 experimental and subject to change.
 
 You can disable the verbose rebuild output with `editable.verbose=false` if you
@@ -591,13 +752,22 @@ added via scikit-build-core's package discovery will be found in the original
 location, so changes there are picked up on import, regardless of the
 `editable.rebuild` setting.
 
+The redirecting finder is installed at interpreter startup. On Python 3.15+,
+this uses a [PEP 829][] `.start` file (the slightly safer, structured
+replacement for the deprecated `import` line in a `.pth` file); on older Pythons
+it uses the classic `.pth` `import` line. This is handled automatically based on
+the interpreter running the editable install.
+
+[PEP 829]: https://peps.python.org/pep-0829/
+[PEP 817]: https://peps.python.org/pep-0817/
+
 :::{note}
 
-A second experimental mode, `"inplace"`, is also available. This does an
-in-place CMake build, so all the caveats there apply too -- only one build per
-source directory, you can't change to an out-of-source builds without removing
-the build artifacts, your source directory will be littered with build
-artifacts, etc. Also, to make your binaries importable, you should set
+A second mode, `"inplace"`, is also available. This does an in-place CMake
+build, so all the caveats there apply too -- only one build per source
+directory, you can't change to an out-of-source builds without removing the
+build artifacts, your source directory will be littered with build artifacts,
+etc. Also, to make your binaries importable, you should set
 `LIBRARY_OUTPUT_DIRECTORY` (include a generator expression, like the empty one
 `$<0:>` for multi-config generator support, like MSVC, so you don't have to set
 all possible `*_<CONFIG>` variations) to make sure they are placed inside your
@@ -678,6 +848,23 @@ only be used if you enable them:
 [tool.scikit-build]
 experimental = true
 ```
+
+The following features currently require this flag:
+
+- **Wheel variants**: [PEP 817][] variant support (`variant`, `variant-name`,
+  `variant-label`, and `null-variant`). See
+  [](../guide/faqs.md#building-wheel-variants-experimental).
+- **Third-party dynamic-metadata plugins**: dynamic metadata providers not
+  shipped with scikit-build-core (anything using `provider-path` or a provider
+  outside the `scikit_build_core.*` namespace). See [](./dynamic.md).
+- **Absolute `wheel.install-dir`**: an absolute install dir is placed one level
+  above the platlib root, giving access to `/platlib`, `/data`, `/headers`,
+  `/scripts`, and `/metadata`. See
+  [`wheel.install-dir`](../reference/configs.md).
+
+The [rebuild-on-import feature](#editable-installs) for editable installs is
+also considered experimental and subject to change, but is not gated behind this
+flag.
 
 You can also fail the build with `fail = true`. This is useful with overrides if
 you want to make a specific configuration fail. If this is set, extra

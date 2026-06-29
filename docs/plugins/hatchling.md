@@ -1,13 +1,12 @@
 # Hatchling
 
-A [hatchling][] plugin is being developed for scikit-build-core. This is
-currently in a highly experimental state, but feedback is welcome.
+A [hatchling][] plugin is provided by scikit-build-core. Feedback is welcome.
 
 :::{warning}
 
-This plugin is experimental, and will probably be moved to a separate package.
-If using it, it is highly recommended to upper-cap scikit-build-core until it
-moves.
+Use the `[hatchling]` extra when using this plugin. It will ensure a proper
+version of hatchling, and will help protect you if the plugin moves to a
+separate package in the future.
 
 :::
 
@@ -23,13 +22,11 @@ get `cmake` and `ninja` auto-added if needed, and 1.24 if you want to write out
 custom scripts, metadata, or shared data.
 
 You need a `tool.hatch.build.targets.wheel.hooks.scikit-build` section to
-activate the plugin. Currently, you need at least the `experimental` option to
-use the plugin, which means you acknowledge that this might move in the next
-release of scikit-build-core. It was added in 0.9.
+activate the plugin. It was added in 0.9.
 
 ```toml
 [build-system]
-requires = ["hatchling", "scikit-build-core~=0.9.0"]
+requires = ["hatchling", "scikit-build-core[hatchling]"]
 build-backend = "hatchling.build"
 
 [project]
@@ -37,21 +34,7 @@ name = "hatchling_example"
 version = "0.1.0"
 
 [tool.hatch.build.targets.wheel.hooks.scikit-build]
-experimental = true
 ```
-
-:::{note}
-
-Note that this is equivalent:
-
-```toml
-[tool.hatch.build.targets.wheel.hooks.scikit-build]
-
-[tool.scikit-build]
-experimental = true
-```
-
-:::
 
 ## Options
 
@@ -67,9 +50,8 @@ Key limitations:
 
 - You need to leave `cmake.wheel` on. No `wheel.platlib = False` builds.
 - Using cmake in SDist step is not supported yet.
-- Editable installs are not supported yet.
 - `scikit-build.generate` and `scikit-build.metadata` is not supported.
-- `${SKBUILD_HEADER_DIR}` is not supported, request support in Hatching if
+- `${SKBUILD_HEADER_DIR}` is not supported, request support in Hatchling if
   needed.
 - Anything in `${SKBUILD_METADATA_DIR}` must be placed in an `extra_metadata`
   folder.

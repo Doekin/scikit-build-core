@@ -65,8 +65,8 @@ features over classic Scikit-build:
 - Dedicated entrypoints for module and prefix directories
 - Several integrated dynamic metadata plugins (proposing standardized support
   soon)
-- Experimental editable mode support, with optional experimental auto rebuilds
-  on import and optional in-place mode
+- Editable mode support, with optional experimental auto rebuilds on import and
+  optional in-place mode
 - Supports WebAssembly (Emscripten/[Pyodide](https://pyodide.org)).
 - Supports [free-threaded Python 3.13+](https://py-free-threading.github.io).
 
@@ -81,22 +81,21 @@ Some known missing features that will be developed soon:
   including setuptools)
 - Several editable mode caveats (mentioned in the docs).
 
-Other backends are also planned:
+Other backends are also available:
 
-- Setuptools integration highly experimental
-- Hatchling plugin highly experimental
+- Setuptools integration (use the `[setuptools]` extra)
+- Hatchling plugin (use the `[hatchling]` extra)
 
-The recommended interface is the native pyproject builder. There is also a WIP
-setuptools-based interface that is being developed to provide a transition path
-for classic scikit-build, and a WIP Hatchling plugin. Both might be moved to
-standalone packages in the future.
+The recommended interface is the native pyproject builder. There is also a
+setuptools-based interface that provides a transition path for classic
+scikit-build, and a Hatchling plugin.
 
 > [!WARNING]
 >
-> Only the pyproject-based builder should be used; the setuptools backend is
-> experimental and likely to move to a separate package before being declared
-> stable, and internal API is still being solidified. A future version of this
-> package will support creating new build extensions.
+> The setuptools and hatchling backends might move to standalone packages in the
+> future, so depend on them via the `scikit-build-core[setuptools]` and
+> `scikit-build-core[hatchling]` extras to stay protected if they do. The
+> internal API for writing new build extensions is still being solidified.
 
 ## Example
 
@@ -202,6 +201,12 @@ sdist.reproducible = true
 # If set to True, CMake will be run before building the SDist.
 sdist.cmake = false
 
+# Force-include files into the SDist.
+sdist.force-include = {}
+
+# Which symlinks to resolve in the SDist, storing the target's contents instead.
+sdist.resolve-symlinks = "all"
+
 # A list of packages to auto-copy into the wheel.
 wheel.packages = ["src/<package>", "python/<package>", "<package>"]
 
@@ -228,6 +233,9 @@ wheel.exclude = []
 
 # The build tag to use for the wheel. If empty, no build tag is used.
 wheel.build-tag = ""
+
+# Force-include files into the wheel.
+wheel.force-include = {}
 
 # If CMake is less than this value, backport a copy of FindPython.
 backport.find-python = "3.26.1"
@@ -256,6 +264,9 @@ build.requires = []
 # The components to install.
 install.components = []
 
+# Build targets to run during the install step via ``cmake --build --target``.
+install.targets = []
+
 # Whether to strip the binaries.
 install.strip = true
 
@@ -282,6 +293,9 @@ search.site-packages = true
 
 # List dynamic metadata fields and hook locations in this table.
 metadata = {}
+
+# A table of environment variables to set for the CMake subprocesses.
+env = {}
 
 # Strictly check all config options.
 strict-config = true
@@ -336,7 +350,7 @@ those of the author(s) and do not necessarily reflect the views of the National
 Science Foundation.
 
 <!-- prettier-ignore-start -->
-[OAC-2209877]:              https://www.nsf.gov/awardsearch/show-award?AWD_ID=2209877&HistoricalAwards=false
+[OAC-2209877]:              https://www.nsf.gov/awardsearch/show-award/?AWD_ID=2209877&HistoricalAwards=false
 [actions-badge]:            https://github.com/scikit-build/scikit-build-core/actions/workflows/ci.yml/badge.svg
 [actions-link]:             https://github.com/scikit-build/scikit-build-core/actions
 [cmeel]:                    https://github.com/cmake-wheel/cmeel

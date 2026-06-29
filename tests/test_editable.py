@@ -17,23 +17,27 @@ import pytest
         pytest.param(
             True,
             id="package",
-            marks=[pytest.mark.xfail(reason="Only data folders supported currently")],
         ),
-        pytest.param(False, id="datafolder"),
+        pytest.param(
+            False,
+            id="datafolder",
+        ),
     ],
 )
 @pytest.mark.parametrize("package", ["navigate_editable"], indirect=True)
 @pytest.mark.usefixtures("package")
-@pytest.mark.xfail(
-    sys.version_info[:2] == (3, 9), reason="Python 3.9 not supported yet"
-)
 def test_navigate_editable(isolated, isolate, py_pkg):
     if py_pkg:
         init_py = Path("python/shared_pkg/data/__init__.py")
         init_py.touch()
 
     isolated.install(
-        "-v", "--config-settings=build-dir=build/{wheel_tag}", *isolate.flags, "-e", "."
+        "-v",
+        "--config-settings=build-dir=build/{wheel_tag}",
+        *isolate.flags,
+        "-e",
+        ".",
+        installer="pip",
     )
 
     value = isolated.execute("import shared_pkg; shared_pkg.call_c_method()")
@@ -53,6 +57,7 @@ def test_navigate_editable(isolated, isolate, py_pkg):
 @pytest.mark.configure
 @pytest.mark.integration
 @pytest.mark.parametrize("isolate", {False}, indirect=True)
+@pytest.mark.parametrize("editable", ["redirect", "inplace"], indirect=True)
 @pytest.mark.parametrize(
     "multiple_packages",
     [["cython_pxd_editable/pkg1", "cython_pxd_editable/pkg2"]],
@@ -68,6 +73,7 @@ def test_cython_pxd(multiple_packages, editable, isolated, isolate):
             *isolate.flags,
             *editable.flags,
             str(package.workdir),
+            installer="pip",
         )
 
 
@@ -101,6 +107,7 @@ def test_install_dir(isolated, isolate):
         *isolate.flags,
         "-e",
         ".",
+        installer="pip",
     )
 
     # Make sure the package is correctly installed in the subdirectory
@@ -134,6 +141,7 @@ def test_direct_import(editable, isolated):
         "-v",
         *editable.flags,
         ".",
+        installer="pip",
     )
 
     isolated.execute("import pkg")
@@ -151,8 +159,6 @@ def test_importlib_resources(editable, isolated):
         pytest.skip("importlib.resources.files is introduced in Python 3.9")
 
     # TODO: Investigate these failures
-    if editable.mode == "redirect":
-        pytest.xfail("Redirect mode is at navigating importlib.resources.files")
     if platform.system() == "Windows" and editable.mode == "inplace":
         pytest.xfail("Windows fails to import the top-level extension module")
 
@@ -160,6 +166,7 @@ def test_importlib_resources(editable, isolated):
         "-v",
         *editable.flags,
         ".",
+        installer="pip",
     )
 
     isolated.execute(

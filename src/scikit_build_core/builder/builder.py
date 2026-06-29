@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import os
 import re
 import shlex
@@ -30,9 +31,21 @@ if TYPE_CHECKING:
     from ..cmake import CMaker
     from ..settings.skbuild_model import ScikitBuildSettings
 
-__all__ = ["Builder", "archs_to_tags", "get_archs"]
+__all__ = [
+    "Builder",
+    "archs_to_tags",
+    "get_archs",
+    "get_cmake_args_from_settings",
+    "set_environment_from_settings",
+]
 
 DIR = Path(__file__).parent.resolve()
+
+
+class _SabiMode(enum.Enum):
+    NONE = enum.auto()
+    ABI3 = enum.auto()
+    ABI3T = enum.auto()
 
 
 def __dir__() -> list[str]:
@@ -85,6 +98,43 @@ def _filter_env_cmake_args(env_cmake_args: list[str]) -> Generator[str, None, No
             yield arg
 
 
+def get_cmake_args_from_settings(
+    settings: ScikitBuildSettings, env: Mapping[str, str]
+) -> list[str]:
+    """
+    Get CMake args from the settings and environment (settings ``cmake.args``
+    plus the filtered ``CMAKE_ARGS`` environment variable).
+    """
+    # Adding CMake arguments set as environment variable
+    # (needed e.g. to build for ARM OSX on conda-forge)
+    env_cmake_args: list[str] = list(
+        filter(None, shlex.split(env.get("CMAKE_ARGS", "")))
+    )
+
+    if env_cmake_args:
+        logger.debug("Env CMAKE_ARGS: {}", env_cmake_args)
+
+    return [*settings.cmake.args, *_filter_env_cmake_args(env_cmake_args)]
+
+
+def set_environment_from_settings(
+    env: dict[str, str], settings: ScikitBuildSettings
+) -> None:
+    """
+    Apply the ``tool.scikit-build.env`` table to ``env`` (mutated in place).
+
+    Each entry is resolved against ``env`` and written back unless it is already
+    set (``setdefault`` semantics), with ``force = true`` overriding. Entries
+    that resolve to nothing are skipped.
+    """
+    for name, value in settings.env.items():
+        resolved = value.resolve(env)
+        if resolved is None:
+            continue
+        if value.force or name not in env:
+            env[name] = resolved
+
+
 def _sanitize_path(path: Any) -> list[Path]:
     # This handles classes like:
     # MultiplexedPath from importlib.resources.readers (3.11+)
@@ -102,20 +152,17 @@ class Builder:
     settings: ScikitBuildSettings
     config: CMaker
 
+    def __post_init__(self) -> None:
+        # Apply the user's env table before configure/build/install so it is
+        # visible to all CMake subprocesses (which share ``config.env``).
+        if self.settings.env:
+            set_environment_from_settings(self.config.env, self.settings)
+
     def get_cmake_args(self) -> list[str]:
         """
         Get CMake args from the settings and environment.
         """
-        # Adding CMake arguments set as environment variable
-        # (needed e.g. to build for ARM OSX on conda-forge)
-        env_cmake_args: list[str] = list(
-            filter(None, shlex.split(self.config.env.get("CMAKE_ARGS", "")))
-        )
-
-        if env_cmake_args:
-            logger.debug("Env CMAKE_ARGS: {}", env_cmake_args)
-
-        return [*self.settings.cmake.args, *_filter_env_cmake_args(env_cmake_args)]
+        return get_cmake_args_from_settings(self.settings, self.config.env)
 
     def get_generator(self, *args: str) -> str | None:
         return self.config.get_generator(
@@ -191,7 +238,11 @@ class Builder:
 
         current_gen = self.get_generator(*configure_args)
         local_def = set_environment_for_gen(
-            current_gen, self.config.cmake, self.config.env, self.settings.ninja
+            current_gen,
+            self.config.cmake,
+            self.config.env,
+            self.settings.ninja,
+            env_managed_keys=self.settings.env.keys(),
         )
         cmake_defines.update(local_def)
 
@@ -204,38 +255,58 @@ class Builder:
             canonical_name = name.replace("-", "_").replace(".", "_")
             cache_config["SKBUILD_PROJECT_NAME"] = canonical_name
         if version is not None:
+            # Cap to four components so it is valid for project(VERSION ...)
             cache_config["SKBUILD_PROJECT_VERSION"] = ".".join(
-                str(v) for v in version.release
+                str(v) for v in version.release[:4]
             )
             cache_config["SKBUILD_PROJECT_VERSION_FULL"] = str(version)
 
-        if limited_api is None:
-            if self.settings.wheel.py_api.startswith("cp3"):
-                target_minor_version = int(self.settings.wheel.py_api[3:])
-                limited_api = target_minor_version <= sys.version_info.minor
+        py_api = self.settings.wheel.py_api
+        gil_disabled = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+        sabi = _SabiMode.NONE
+        if limited_api is True:
+            # Handle externally-set limited_api (e.g. from setuptools)
+            if sys.implementation.name != "cpython":
+                logger.info("PyPy doesn't support the Limited API, ignoring")
+            elif gil_disabled:
+                sabi = _SabiMode.ABI3T
             else:
-                limited_api = False
-
-        if limited_api and sys.implementation.name != "cpython":
-            limited_api = False
-            logger.info("PyPy doesn't support the Limited API, ignoring")
-
-        if limited_api and sysconfig.get_config_var("Py_GIL_DISABLED"):
-            limited_api = False
-            logger.info(
-                "Free-threaded Python doesn't support the Limited API currently, ignoring"
-            )
+                sabi = _SabiMode.ABI3
+        elif limited_api is None and py_api.startswith("cp3"):
+            target_minor_version = int(py_api[3:].rstrip("t"))
+            if sys.implementation.name != "cpython":
+                logger.info("py-api {} requires CPython, ignoring", py_api)
+            elif py_api.endswith("t"):
+                # Free-threaded stable ABI (PEP 803 / abi3t)
+                if gil_disabled and target_minor_version <= sys.version_info.minor:
+                    sabi = _SabiMode.ABI3T
+                else:
+                    logger.info(
+                        "py-api {} requires free-threaded CPython >= 3.{}, ignoring",
+                        py_api,
+                        target_minor_version,
+                    )
+            # Classic stable ABI (abi3)
+            elif gil_disabled:
+                logger.info(
+                    "Free-threaded Python doesn't support the classic Limited API, ignoring"
+                )
+            elif target_minor_version <= sys.version_info.minor:
+                sabi = _SabiMode.ABI3
 
         python_library = get_python_library(self.config.env, abi3=False)
-        python_sabi_library = (
-            get_python_library(self.config.env, abi3=True) if limited_api else None
-        )
+        python_sabi_library = None
+        if sabi == _SabiMode.ABI3T:
+            python_sabi_library = get_python_library(self.config.env, abi3t=True)
+        elif sabi == _SabiMode.ABI3:
+            python_sabi_library = get_python_library(self.config.env, abi3=True)
         python_include_dir = get_python_include_dir()
         numpy_include_dir = get_numpy_include_dir()
 
         # Warning for CPython 3.13.4 Windows bug
         if (
-            sys.implementation.name == "CPython"
+            sys.implementation.name == "cpython"
             and sys.version_info[:3] == (3, 13, 4)
             and sys.platform.startswith("win32")
             and not sysconfig.get_config_var("Py_GIL_DISABLED")
@@ -257,7 +328,10 @@ class Builder:
                 cache_config[f"{prefix}_ROOT_DIR"] = Path(sys.base_exec_prefix)
                 cache_config[f"{prefix}_INCLUDE_DIR"] = python_include_dir
                 cache_config[f"{prefix}_FIND_REGISTRY"] = "NEVER"
-                # FindPython may break if this is set - only useful on Windows
+                # On Windows the library is constructed and existence-checked,
+                # so this is reliable. On POSIX a library hint can break
+                # FindPython (which resolves it fine on its own), so this
+                # stays Windows-only.
                 if python_library and sysconfig.get_platform().startswith("win"):
                     cache_config[f"{prefix}_LIBRARY"] = python_library
                 if python_sabi_library and sysconfig.get_platform().startswith("win"):
@@ -265,20 +339,28 @@ class Builder:
                 if numpy_include_dir:
                     cache_config[f"{prefix}_NumPy_INCLUDE_DIR"] = numpy_include_dir
 
-        cache_config["SKBUILD_SOABI"] = get_soabi(self.config.env, abi3=limited_api)
+        cache_config["SKBUILD_SOABI"] = get_soabi(
+            self.config.env,
+            abi3=(sabi == _SabiMode.ABI3),
+            abi3t=(sabi == _SabiMode.ABI3T),
+        )
 
         # Allow CMakeLists to detect this is supposed to be a limited ABI build
         cache_config["SKBUILD_SABI_COMPONENT"] = (
-            "Development.SABIModule" if limited_api else ""
+            "Development.SABIModule" if sabi != _SabiMode.NONE else ""
         )
 
         # Allow users to detect the version requested in settings
-        py_api = self.settings.wheel.py_api
-        cache_config["SKBUILD_SABI_VERSION"] = (
-            f"{py_api[2]}.{py_api[3:]}"
-            if limited_api and py_api.startswith("cp")
-            else ""
-        )
+        if sabi != _SabiMode.NONE and py_api.startswith("cp"):
+            version_str = py_api[2:]
+            if version_str.endswith("t"):
+                version_str = version_str[:-1]
+            cache_config["SKBUILD_SABI_VERSION"] = f"{version_str[0]}.{version_str[1:]}"
+        else:
+            cache_config["SKBUILD_SABI_VERSION"] = ""
+
+        if sabi == _SabiMode.ABI3T:
+            cache_config["Py_TARGET_ABI3T"] = "1"
 
         if cache_entries:
             cache_config.update(cache_entries)
@@ -286,8 +368,9 @@ class Builder:
         self.config.init_cache(cache_config)
 
         if sys.platform.startswith("darwin"):
-            # Cross-compile support for macOS - respect ARCHFLAGS if set
-            archs = get_archs(self.config.env)
+            # Cross-compile support for macOS - respect ARCHFLAGS if set,
+            # unless CMAKE_SYSTEM_PROCESSOR is in the cmake args (conda, #207)
+            archs = get_archs(self.config.env, self.get_cmake_args())
             if archs:
                 cmake_defines["CMAKE_OSX_ARCHITECTURES"] = ";".join(archs)
 
@@ -320,6 +403,9 @@ class Builder:
         configuring for maximum compatibility.
         """
         components = self.settings.install.components
+        targets = self.settings.install.targets
         strip = self.settings.install.strip
         assert strip is not None
-        self.config.install(install_dir, strip=strip, components=components)
+        self.config.install(
+            install_dir, strip=strip, components=components, targets=targets
+        )

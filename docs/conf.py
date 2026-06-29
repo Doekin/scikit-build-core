@@ -74,7 +74,7 @@ extensions = [
 ]
 
 # Add any paths that contain templates here, relative to this directory.
-templates_path = []
+templates_path = ["_templates"]
 
 source_suffix = [".rst", ".md"]
 
@@ -103,6 +103,8 @@ tippy_rtd_urls = [
     "https://packaging.readthedocs.io/en/stable",
     "https://setuptools.readthedocs.io/en/latest",
 ]
+# Recolored to furo's theme variables in _static/tippy.css.
+tippy_props = {"theme": "light-border"}
 
 nitpick_ignore = [
     ("py:class", "setuptools.dist.Distribution"),
@@ -120,6 +122,8 @@ linkcheck_anchors_ignore = [
 linkcheck_ignore = [
     # Rate limited
     r"https://github.com/?.*",
+    # Fails sometimes
+    "https://learn.scientific-python.org/development",
 ]
 # -- Options for HTML output -------------------------------------------------
 
@@ -147,6 +151,14 @@ html_theme_options = {
 }
 html_copy_source = False
 html_show_sourcelink = False
+html_static_path = ["_static"]
+# The light-border theme gives the tooltip arrow an outline; tippy.css recolors
+# it (and the box) from furo's theme variables. tippy.css must come last so its
+# overrides win. sphinx-tippy already loads tippy.js itself from this CDN.
+html_css_files = [
+    "https://unpkg.com/tippy.js@6/themes/light-border.css",
+    "tippy.css",
+]
 
 
 # -- Extension configuration -------------------------------------------------

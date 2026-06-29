@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import difflib
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
@@ -13,15 +14,17 @@ from packaging.version import Version
 from .. import __version__
 from .._compat import tomllib
 from .._logging import logger, rich_error, rich_print, rich_warning
+from .._variants import validate_variant_settings
+from ..ast.ast import ParseError
 from ..errors import CMakeConfigError
+from ..utils.typing import get_target_raw_type
 from .auto_cmake_version import find_min_cmake_version
 from .auto_requires import get_min_requires
 from .skbuild_model import CMakeSettings, NinjaSettings, ScikitBuildSettings
 from .skbuild_overrides import process_overrides
-from .sources import ConfSource, EnvSource, SourceChain, TOMLSource
+from .sources import ConfSource, EnvSource, Source, SourceChain, TOMLSource
 
 if TYPE_CHECKING:
-    import os
     from collections.abc import Generator, Mapping
 
     from .skbuild_overrides import OverrideRecord
@@ -138,20 +141,56 @@ def _handle_move(
 def _validate_overrides(
     settings: ScikitBuildSettings,
     overrides: dict[str, OverrideRecord],
+    *,
+    dynamic_sources: tuple[Source, ...],
+    toml_sources: tuple[Source, ...],
 ) -> None:
-    """Validate all fields with any override information."""
+    """
+    Validate all fields with any override information.
+
+    ``dynamic_sources`` are the sources that may legitimately set
+    ``override_only`` fields at build time (env vars and PEP 517
+    config-settings); ``toml_sources`` are the static ``pyproject.toml`` (and
+    ``extra_settings``) tables where ``override_only`` fields are forbidden
+    outside of an ``[[overrides]]`` section.
+    """
 
     def validate_field(
         field: dataclasses.Field[Any],
         value: Any,
         prefix: str = "",
+        path: tuple[str, ...] = (),
         record: OverrideRecord | None = None,
     ) -> None:
         """Do the actual validation."""
         # Check if we had a hard-coded value in the record
         conf_key = field.name.replace("_", "-")
         if field.metadata.get("override_only", False):
-            original_value = record.original_value if record else value
+            # has_item needs dict-presence semantics for dict-valued fields,
+            # since some sources represent dict entries as nested keys.
+            is_dict = get_target_raw_type(field.type) is dict
+            # override-only fields may be set dynamically via env vars or
+            # config-settings; only static pyproject.toml values are forbidden.
+            if any(
+                source.has_item(*path, field.name, is_dict=is_dict)
+                for source in dynamic_sources
+            ):
+                return
+
+            # Decide whether the value was actually hard-coded in pyproject.toml.
+            # We can't rely on `value is not None`, since some override-only
+            # fields have non-None falsy defaults (e.g. [] or False), so we ask
+            # the TOML sources whether the key is really present.
+            if record is not None:
+                original_value = record.original_value
+            elif any(
+                source.has_item(*path, field.name, is_dict=is_dict)
+                for source in toml_sources
+            ):
+                original_value = value
+            else:
+                original_value = None
+
             if original_value is not None:
                 msg = f"{prefix}{conf_key} is not allowed to be hard-coded in the pyproject.toml file"
                 if settings.strict_config:
@@ -164,6 +203,7 @@ def _validate_overrides(
         obj: Any,
         record: OverrideRecord | None = None,
         prefix: str = "",
+        path: tuple[str, ...] = (),
     ) -> None:
         """Navigate through all the keys and validate each field."""
         for field in dataclasses.fields(obj):
@@ -175,11 +215,15 @@ def _validate_overrides(
                 field=field,
                 value=value,
                 prefix=prefix,
+                path=path,
                 record=closest_record,
             )
             if dataclasses.is_dataclass(value):
                 validate_field_recursive(
-                    obj=value, record=closest_record, prefix=f"{prefix}{conf_key}."
+                    obj=value,
+                    record=closest_record,
+                    prefix=f"{prefix}{conf_key}.",
+                    path=(*path, field.name),
                 )
 
     # Navigate all fields starting from the top-level
@@ -201,6 +245,7 @@ class SettingsReader:
         retry: bool = False,
     ) -> None:
         self.state = state
+        environ = os.environ if env is None else env
 
         # Handle overrides
         pyproject = copy.deepcopy(pyproject)
@@ -241,7 +286,11 @@ class SettingsReader:
 
         if extra_settings is not None:
             extra_skb = copy.deepcopy(dict(extra_settings))
-            process_overrides(extra_skb, state=state, env=env, retry=retry)
+            extra_matched, extra_overridden = process_overrides(
+                extra_skb, state=state, env=env, retry=retry
+            )
+            self.overrides |= extra_matched
+            self.overridden_items.update(extra_overridden)
             toml_srcs.insert(0, TOMLSource(settings=extra_skb))
 
         prefixed = {
@@ -250,14 +299,33 @@ class SettingsReader:
         remaining = {
             k: v for k, v in config_settings.items() if not k.startswith("skbuild.")
         }
-        self.sources = SourceChain(
+        # Sources that may legitimately set override-only fields at build time.
+        dynamic_srcs: list[Source] = [
             EnvSource("SKBUILD", env=env),
             ConfSource("skbuild", settings=prefixed, verify=verify_conf),
             ConfSource(settings=remaining, verify=verify_conf),
+        ]
+        # Static pyproject.toml (and extra_settings) tables; override-only fields
+        # are forbidden here outside of an [[overrides]] section.
+        self._dynamic_srcs = tuple(dynamic_srcs)
+        self._toml_srcs = tuple(toml_srcs)
+        self.sources = SourceChain(
+            *dynamic_srcs,
             *toml_srcs,
             prefixes=["tool", "scikit-build"],
         )
         self.settings = self.sources.convert_target(ScikitBuildSettings)
+
+        # CMake 3.22+ reads CMAKE_BUILD_TYPE from the environment, but only as a
+        # default for the first configure; the -DCMAKE_BUILD_TYPE we always pass
+        # (default "Release") would override it. Honor the environment value when
+        # build-type wasn't configured, which also works on older CMake.
+        if "CMAKE_BUILD_TYPE" in environ and not self.sources.has_item(
+            "cmake", "build_type", is_dict=False
+        ):
+            self.settings.cmake.build_type = environ["CMAKE_BUILD_TYPE"]
+
+        validate_variant_settings(self.settings)
 
         static_settings = SourceChain(
             *toml_srcs, prefixes=["tool", "scikit-build"]
@@ -315,6 +383,12 @@ class SettingsReader:
                 rich_warning(
                     "CMakeLists.txt not found when looking for minimum CMake version. "
                     "Report this or (and) set manually to avoid this warning. Using 3.15 as a fall-back."
+                )
+            except ParseError:
+                new_min_cmake = None
+                rich_warning(
+                    "CMakeLists.txt could not be parsed when looking for minimum "
+                    "CMake version. Report this or (and) set manually to avoid this warning."
                 )
 
             if new_min_cmake is None:
@@ -380,6 +454,22 @@ class SettingsReader:
         else:
             self.settings.sdist.inclusion_mode = "default"
 
+        if self.settings.sdist.resolve_symlinks is not None:
+            if (
+                self.settings.minimum_version is not None
+                and self.settings.minimum_version < Version("1.0")
+            ):
+                rich_error(
+                    "minimum-version can't be less than 1.0 to use sdist.resolve-symlinks"
+                )
+        elif (
+            self.settings.minimum_version is not None
+            and self.settings.minimum_version < Version("1.0")
+        ):
+            self.settings.sdist.resolve_symlinks = "none"
+        else:
+            self.settings.sdist.resolve_symlinks = "all"
+
     def unrecognized_options(self) -> Generator[str, None, None]:
         return self.sources.unrecognized_options(ScikitBuildSettings)
 
@@ -397,10 +487,17 @@ class SettingsReader:
         return result
 
     def print_suggestions(self) -> None:
-        for index in (1, 2, 3):
-            name = {1: "config-settings", 2: "config-settings", 3: "pyproject.toml"}[
-                index
-            ]
+        # Index 0 is the env source (skipped); the config-settings sources follow,
+        # then the TOML sources. The last TOML source is always pyproject.toml;
+        # any earlier ones are extra settings injected by a plugin (e.g. hatch).
+        n_dynamic = len(self._dynamic_srcs)
+        names = dict.fromkeys(range(1, n_dynamic), "config-settings")
+        for offset in range(len(self._toml_srcs)):
+            is_pyproject = offset == len(self._toml_srcs) - 1
+            names[n_dynamic + offset] = (
+                "pyproject.toml" if is_pyproject else "extra settings"
+            )
+        for index, name in names.items():
             suggestions_dict = self.suggestions(index)
             if suggestions_dict:
                 rich_print(
@@ -421,7 +518,12 @@ class SettingsReader:
                 self.print_suggestions()
                 raise SystemExit(7)
             logger.warning("Unrecognized options: {}", ", ".join(unrecognized))
-        _validate_overrides(self.settings, self.overridden_items)
+        _validate_overrides(
+            self.settings,
+            self.overridden_items,
+            dynamic_sources=self._dynamic_srcs,
+            toml_sources=self._toml_srcs,
+        )
 
         for key, value in self.settings.metadata.items():
             if "provider" not in value:

@@ -12,7 +12,8 @@ from packaging.version import Version
 
 import scikit_build_core._logging
 import scikit_build_core.settings.skbuild_read_settings
-from scikit_build_core.settings.skbuild_model import GenerateSettings
+from scikit_build_core._compat.builtins import ExceptionGroup
+from scikit_build_core.settings.skbuild_model import EnvValue, GenerateSettings
 from scikit_build_core.settings.skbuild_read_settings import SettingsReader
 
 
@@ -43,6 +44,7 @@ def test_skbuild_settings_default(tmp_path: Path):
     assert settings.sdist.inclusion_mode == "default"
     assert settings.sdist.reproducible
     assert not settings.sdist.cmake
+    assert settings.sdist.resolve_symlinks == "all"
     assert settings.wheel.packages is None
     assert settings.wheel.py_api == ""
     assert not settings.wheel.expand_macos_universal_tags
@@ -52,19 +54,132 @@ def test_skbuild_settings_default(tmp_path: Path):
     assert settings.backport.find_python == Version("3.26.1")
     assert settings.strict_config
     assert not settings.experimental
+    assert settings.variant == []
+    assert settings.variant_name == []
+    assert settings.variant_label is None
+    assert not settings.null_variant
     assert settings.minimum_version is None
     assert settings.build_dir == ""
     assert settings.metadata == {}
+    assert settings.env == {}
+    assert settings.sdist.force_include == {}
+    assert settings.wheel.force_include == {}
     assert settings.editable.mode == "redirect"
     assert not settings.editable.rebuild
     assert settings.editable.verbose
     assert settings.build.tool_args == []
     assert settings.install.components == []
+    assert settings.install.targets == []
     assert settings.install.strip
     assert settings.generate == []
     assert not settings.fail
     assert settings.messages.after_failure == ""
     assert settings.messages.after_success == ""
+
+
+def test_skbuild_settings_env_table(tmp_path: Path):
+    """The top-level env table parses literal, env-indirection, and force forms."""
+    from scikit_build_core.settings.skbuild_model import EnvValue
+
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build.env]
+            LITERAL = "hello"
+            CMAKE_BUILD_PARALLEL_LEVEL = { env = "MAX_JOBS" }
+            WITH_DEFAULT = { env = "NOT_SET", default = "fallback" }
+            FORCED = { default = "forced", force = true }
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+    assert list(settings_reader.unrecognized_options()) == []
+    env = settings_reader.settings.env
+
+    assert env == {
+        "LITERAL": EnvValue("hello"),
+        "CMAKE_BUILD_PARALLEL_LEVEL": EnvValue({"env": "MAX_JOBS"}),
+        "WITH_DEFAULT": EnvValue({"env": "NOT_SET", "default": "fallback"}),
+        "FORCED": EnvValue({"default": "forced", "force": True}),
+    }
+    assert env["FORCED"].force
+    assert not env["LITERAL"].force
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {"force": "false"},
+        {"force": 1},
+        {"default": 8},
+        {"env": True},
+        {"unknown": "x"},
+    ],
+)
+def test_env_value_rejects_bad_types(raw: object):
+    """Wrong TOML types are rejected at conversion, not silently coerced.
+
+    Notably ``force = "false"`` must not coerce to ``True`` via ``bool(...)``.
+    """
+    from scikit_build_core.settings.skbuild_model import EnvValue
+
+    with pytest.raises(TypeError):
+        EnvValue(raw)  # type: ignore[arg-type]
+
+
+def test_skbuild_settings_env_table_bad_force_rejected(tmp_path: Path):
+    """A malformed env table in pyproject.toml errors instead of coercing."""
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build.env]
+            FOO = { default = "x", force = "false" }
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExceptionGroup):
+        SettingsReader.from_file(pyproject_toml, {})
+
+
+def test_skbuild_settings_cmake_build_type_envvar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """CMAKE_BUILD_TYPE in the environment is honored when build-type is unset."""
+    monkeypatch.setenv("CMAKE_BUILD_TYPE", "RelWithAssert")
+
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text("", encoding="utf-8")
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+    assert list(settings_reader.unrecognized_options()) == []
+    assert settings_reader.settings.cmake.build_type == "RelWithAssert"
+
+
+def test_skbuild_settings_cmake_build_type_explicit_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """An explicitly configured cmake.build-type beats CMAKE_BUILD_TYPE."""
+    monkeypatch.setenv("CMAKE_BUILD_TYPE", "RelWithAssert")
+
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build]
+            cmake.build-type = "Debug"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+    assert settings_reader.settings.cmake.build_type == "Debug"
 
 
 def test_skbuild_settings_envvar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -94,6 +209,9 @@ def test_skbuild_settings_envvar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("SKBUILD_BACKPORT_FIND_PYTHON", "0")
     monkeypatch.setenv("SKBUILD_STRICT_CONFIG", "0")
     monkeypatch.setenv("SKBUILD_EXPERIMENTAL", "1")
+    monkeypatch.setenv("SKBUILD_VARIANT", "cpu :: abi :: cp313;gpu :: cuda :: 12.0")
+    monkeypatch.setenv("SKBUILD_VARIANT_NAME", "blas :: impl :: openblas")
+    monkeypatch.setenv("SKBUILD_VARIANT_LABEL", "cpu")
     monkeypatch.setenv("SKBUILD_MINIMUM_VERSION", "0.12")
     monkeypatch.setenv("SKBUILD_BUILD_DIR", "a/b/c")
     monkeypatch.setenv("SKBUILD_EDITABLE_REBUILD", "True")
@@ -102,6 +220,7 @@ def test_skbuild_settings_envvar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setenv("SKBUILD_BUILD_TARGETS", "a;b;c")
     monkeypatch.setenv("SKBUILD_BUILD_TOOL_ARGS", "a;b")
     monkeypatch.setenv("SKBUILD_INSTALL_COMPONENTS", "a;b;c")
+    monkeypatch.setenv("SKBUILD_INSTALL_TARGETS", "x;y;z")
     monkeypatch.setenv("SKBUILD_INSTALL_STRIP", "False")
     monkeypatch.setenv("SKBUILD_FAIL", "1")
     monkeypatch.setenv(
@@ -142,9 +261,15 @@ def test_skbuild_settings_envvar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert settings.backport.find_python == Version("0")
     assert not settings.strict_config
     assert settings.experimental
+    assert settings.variant == ["cpu :: abi :: cp313", "gpu :: cuda :: 12.0"]
+    assert settings.variant_name == ["blas :: impl :: openblas"]
+    assert settings.variant_label == "cpu"
+    assert not settings.null_variant
     assert settings.minimum_version == Version("0.12")
     assert settings.build_dir == "a/b/c"
     assert settings.metadata == {}
+    assert settings.sdist.force_include == {}
+    assert settings.wheel.force_include == {}
     assert settings.editable.mode == "redirect"
     assert settings.editable.rebuild
     assert not settings.editable.verbose
@@ -152,6 +277,7 @@ def test_skbuild_settings_envvar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert settings.build.targets == ["a", "b", "c"]
     assert settings.build.tool_args == ["a", "b"]
     assert settings.install.components == ["a", "b", "c"]
+    assert settings.install.targets == ["x", "y", "z"]
     assert not settings.install.strip
     assert settings.fail
     assert settings.messages.after_failure == "This is a test failure message"
@@ -178,6 +304,7 @@ def test_skbuild_settings_config_settings(
         "cmake.define.b": "2",
         "cmake.build-type": "Debug",
         "cmake.source-dir": "a/b/c",
+        "env.SOME_VAR": "some-value",
         "logging.level": "INFO",
         "sdist.include": ["a", "b", "c"],
         "sdist.exclude": "d;e;f",
@@ -192,6 +319,9 @@ def test_skbuild_settings_config_settings(
         "backport.find-python": "0",
         "strict-config": "false",
         "experimental": "1",
+        "variant": ["cpu :: abi :: cp313", "gpu :: cuda :: 12.0"],
+        "variant-name": "blas :: impl :: openblas",
+        "variant-label": "cpu",
         "minimum-version": "0.10",
         "build-dir": "a/b/c",
         "editable.mode": "redirect",
@@ -201,6 +331,7 @@ def test_skbuild_settings_config_settings(
         "build.targets": ["a", "b", "c"],
         "build.tool-args": ["a", "b"],
         "install.components": ["a", "b", "c"],
+        "install.targets": ["x", "y", "z"],
         "install.strip": "True",
         "fail": "1",
         "messages.after-failure": "This is a test failure message",
@@ -222,6 +353,7 @@ def test_skbuild_settings_config_settings(
     assert settings.build.verbose
     assert settings.cmake.build_type == "Debug"
     assert settings.cmake.source_dir == Path("a/b/c")
+    assert settings.env == {"SOME_VAR": EnvValue("some-value")}
     assert settings.logging.level == "INFO"
     assert settings.sdist.include == ["a", "b", "c"]
     assert settings.sdist.exclude == ["d", "e", "f"]
@@ -236,15 +368,22 @@ def test_skbuild_settings_config_settings(
     assert settings.backport.find_python == Version("0")
     assert not settings.strict_config
     assert settings.experimental
+    assert settings.variant == ["cpu :: abi :: cp313", "gpu :: cuda :: 12.0"]
+    assert settings.variant_name == ["blas :: impl :: openblas"]
+    assert settings.variant_label == "cpu"
+    assert not settings.null_variant
     assert settings.minimum_version == Version("0.10")
     assert settings.build_dir == "a/b/c"
     assert settings.metadata == {}
+    assert settings.sdist.force_include == {}
+    assert settings.wheel.force_include == {}
     assert settings.editable.mode == "redirect"
     assert settings.editable.rebuild
     assert not settings.editable.verbose
     assert settings.build.targets == ["a", "b", "c"]
     assert settings.build.tool_args == ["a", "b"]
     assert settings.install.components == ["a", "b", "c"]
+    assert settings.install.targets == ["x", "y", "z"]
     assert settings.install.strip
     assert settings.fail
     assert settings.messages.after_failure == "This is a test failure message"
@@ -293,6 +432,7 @@ def test_skbuild_settings_pyproject_toml(
             build.targets = ["a", "b", "c"]
             build.tool-args = ["a", "b"]
             install.components = ["a", "b", "c"]
+            install.targets = ["x", "y", "z"]
             install.strip = true
             fail = true
             messages.after-failure = "This is a test failure message"
@@ -346,6 +486,7 @@ def test_skbuild_settings_pyproject_toml(
     assert settings.build.targets == ["a", "b", "c"]
     assert settings.build.tool_args == ["a", "b"]
     assert settings.install.components == ["a", "b", "c"]
+    assert settings.install.targets == ["x", "y", "z"]
     assert settings.install.strip
     assert settings.generate == [
         GenerateSettings(path=Path("a/b/c"), template="hello", location="install"),
@@ -412,9 +553,35 @@ def test_skbuild_settings_pyproject_toml_broken(
         "you",
         "mean:",
         "tool.scikit-build.logging,",
-        "tool.scikit-build.generate,",
-        "tool.scikit-build.search?",
+        "tool.scikit-build.env,",
+        "tool.scikit-build.generate?",
     ]
+
+
+def test_skbuild_settings_variant_requires_experimental(tmp_path: Path):
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        SettingsReader.from_file(
+            pyproject_toml,
+            {"variant": "cpu :: abi :: cp313"},
+        )
+
+
+def test_skbuild_settings_null_variant_conflicts(tmp_path: Path):
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text("", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        SettingsReader.from_file(
+            pyproject_toml,
+            {
+                "experimental": "true",
+                "null-variant": "true",
+                "variant": "cpu :: abi :: cp313",
+            },
+        )
 
 
 def test_skbuild_settings_pyproject_conf_broken(
@@ -780,6 +947,40 @@ def test_skbuild_settings_auto_cmake_warning(
     ]
 
 
+def test_skbuild_settings_auto_cmake_unparseable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+):
+    # A CMakeLists.txt the parser chokes on must fall through to the graceful
+    # warning path with a 3.15 fall-back, not raise an opaque traceback.
+    monkeypatch.setattr(
+        scikit_build_core.settings.skbuild_read_settings, "__version__", "0.10.0"
+    )
+    scikit_build_core._logging.rich_warning.cache_clear()
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build]
+            minimum-version = "0.10"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    cmakelists_txt = tmp_path / "CMakeLists.txt"
+    # Unterminated if-block: the parser raises ParseError.
+    cmakelists_txt.write_text("if(TRUE)\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+
+    assert settings_reader.settings.cmake.version == SpecifierSet(">=3.15")
+
+    ex = capsys.readouterr().err
+    ex = re.sub(r"\x1b(\[.*?[@-~]|\].*?(\x07|\x1b\\))", "", ex)
+    assert "could not be parsed" in ex
+
+
 def test_skbuild_settings_cmake_define_list():
     pyproject_toml = (
         Path(__file__).parent / "packages" / "cmake_defines" / "pyproject.toml"
@@ -947,3 +1148,37 @@ def test_backcompat_sdist_inclusion_mode(
 
     settings_reader = SettingsReader.from_file(pyproject_toml, {})
     assert settings_reader.settings.sdist.inclusion_mode == "classic"
+
+
+def test_backcompat_sdist_resolve_symlinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        scikit_build_core.settings.skbuild_read_settings, "__version__", "1.0.0"
+    )
+    pyproject_toml = tmp_path / "pyproject.toml"
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build]
+            minimum-version = "0.12"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+    assert settings_reader.settings.sdist.resolve_symlinks == "none"
+
+    pyproject_toml.write_text(
+        textwrap.dedent(
+            """\
+            [tool.scikit-build]
+            minimum-version = "1.0"
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    settings_reader = SettingsReader.from_file(pyproject_toml, {})
+    assert settings_reader.settings.sdist.resolve_symlinks == "all"
